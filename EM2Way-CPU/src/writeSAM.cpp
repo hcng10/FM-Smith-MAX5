@@ -7,6 +7,22 @@ inline void writeSAM(uint64_t &bytes, char *buffer, void *a, uint64_t a_bytes){
 	bytes += a_bytes;
 }
 
+inline void writeSAMCStr(uint64_t &bytes, char *buffer, void *a, uint64_t a_bytes){ 
+    
+    char * a_char = (char *)a;
+    uint16_t end_idx = a_bytes;
+    
+    // custom loop to get the first space
+    for (uint64_t i = 0; i < a_bytes; i++){
+        if (a_char[i] == ' '){
+            end_idx = i;
+            break;
+        }
+    }
+    memcpy(&buffer[bytes], a, sizeof(char)*end_idx);
+    bytes += end_idx;
+}
+
 
 inline void writeSAMTab(uint64_t &bytes, char *buffer){
     
@@ -126,8 +142,53 @@ inline char getReverseComplement(char b){
     return rtn_char;
 }
 
+int getChrsIdx(uint32_t pos, std::vector<chr_t> &chrs){
+
+    if (chrs.size() == 0) return 0;
+    // binary search
+    uint16_t chrs_num = chrs.size();
+    uint16_t mid = (chrs_num  - 1)/ 2;
+    
+    uint16_t start = 0;
+    uint16_t end = chrs_num - 1;
+
+    uint16_t sel = 0;
+
+    while(start <= end){
+
+        if (pos > chrs[mid].begin){
+            sel = mid;
+
+            start = mid + 1;
+            end = end;
+            mid = (end - start) / 2 + start; 
+        }
+        else if (pos < chrs[mid].begin){
+            start = start;
+            end = (mid == 0)? mid: mid - 1;
+            mid = (end - start) / 2 + start; 
+
+            sel = end;
+        }
+        else if (pos == chrs[mid].begin){
+            return mid;
+        }
+
+        if (start >= end){
+            if (pos >= chrs[end].begin){
+                return end;
+            }
+            else{
+                return sel;
+            }
+        }
+    }
+    return -1;
+}
+
 void writeSAMFields(uint64_t &bytes, 
                     char *   buffer,
+                    std::vector<chr_t> &chrs,
                     read2Bit_t & read,
                     uint32_t & suppress_aligned,
                     uint32_t * aligned_sai_b,
@@ -138,31 +199,51 @@ void writeSAMFields(uint64_t &bytes,
     uint32_t tmp_val = 0;
     char tmp_char = '0';
     char seq_revc[MAX_READ_LEN+1];
+    int chr_idx;
+    //cerr<<"chk_pt1\n";
 
     // 1. QNAME
-    writeSAM(bytes, buffer, (void *)(read.at_line.c_str()+1), read.at_line.size()-1);
+    writeSAMCStr(bytes, buffer, (void *)(read.at_line.c_str()+1), read.at_line.size()-1);
     writeSAMTab(bytes, buffer);
+    //cerr<<"chk_pt2\n";
 
     // 2. Write Flag
     setSAMFlag(bytes, buffer, read);
     writeSAMTab(bytes, buffer);
+    //cerr<<"chk_pt3\n";
 
-    // TODO: 
-    // 3. Write RNAME
+    // 3. Search and Write RNAME
+    if (chrs.size() == 0){
+        tmp_char = '*';
+        writeSAM(bytes, buffer, &tmp_char, 1);
+    } else{
+       if (is_b){
+            chr_idx = getChrsIdx(aligned_sai_b[sai_i], chrs);
+        }else{
+            chr_idx = getChrsIdx(aligned_sai_f[sai_i], chrs);
+        }
+
+        writeSAMCStr(bytes, buffer, (void *)(chrs[chr_idx].name.c_str()+1), chrs[chr_idx].name.length()-2);
+    }
+    writeSAMTab(bytes, buffer);   
+    //cerr<<"chk_pt4\n";
 
     // 4. Write POS
     if (is_b){
-        writeSAMVal(bytes, buffer, &aligned_sai_b[sai_i], POS_BIT);
+        tmp_val = aligned_sai_b[sai_i] - chrs[chr_idx].begin;
+        writeSAMVal(bytes, buffer, &tmp_val, POS_BIT);
     }
     else{
         writeSAMVal(bytes, buffer, &aligned_sai_f[sai_i], POS_BIT);
     }
     writeSAMTab(bytes, buffer);
+    //cerr<<"chk_pt5\n";
 
     // 5. write QS
     tmp_val = 255;
     writeSAMVal(bytes, buffer, &tmp_val, QS_BIT);
     writeSAMTab(bytes, buffer);
+    //cerr<<"chk_pt6\n";
     
     // 6. write CIGAR
     tmp_val = read.seq_len;
@@ -170,20 +251,24 @@ void writeSAMFields(uint64_t &bytes,
     writeSAMVal(bytes, buffer, &tmp_val, MATCH_BIT);
     writeSAM(bytes, buffer, &tmp_char, 1);
     writeSAMTab(bytes, buffer);
+    //cerr<<"chk_pt7\n";
 
     // 7. RNEXT (pair-end)
     tmp_char = '*';
     writeSAM(bytes, buffer, &tmp_char, 1);
     writeSAMTab(bytes, buffer);
+    //cerr<<"chk_pt8\n";
 
     // 8. PNEXT (pair-end)
     tmp_char = '0';
     writeSAM(bytes, buffer, &tmp_char, 1);
     writeSAMTab(bytes, buffer);
+    //cerr<<"chk_pt9\n";
 
     // 9. TLEN (pair-end)
     writeSAM(bytes, buffer, &tmp_char, 1);
     writeSAMTab(bytes, buffer);
+    //cerr<<"chk_pt10\n";
 
     // 10. SEQ
     if (is_b){
@@ -209,7 +294,7 @@ void writeSAMFields(uint64_t &bytes,
 }
 
 
-void convertSAM(FILE *fp_sam, std::vector<read2Bit_t> &reads, uint32_t *sai, char *buffer){
+void convertSAM(FILE *fp_sam, std::vector<read2Bit_t> &reads, uint32_t *sai, char *buffer, std::vector<chr_t> &chrs){
 
     uint64_t bytes = 0;
     uint32_t aligned_sai_b[ALIGN_REPORT_NUM];
@@ -241,7 +326,7 @@ void convertSAM(FILE *fp_sam, std::vector<read2Bit_t> &reads, uint32_t *sai, cha
                 read.high_bw - read.low_bw - ALIGN_REPORT_NUM: 0;
 
         }
-        cout<<aligned_sai_b[0]<<" ";
+        //cout<<aligned_sai_b[0]<<" ";
 
         if (read.isaligned_fw){
             for (uint32_t j = 0; j < read.high_fw - read.low_fw && j < ALIGN_REPORT_NUM; j++){
@@ -262,6 +347,7 @@ void convertSAM(FILE *fp_sam, std::vector<read2Bit_t> &reads, uint32_t *sai, cha
         for (uint32_t j = 0; j < aligned_num_b; j++){
             writeSAMFields(bytes, 
                             buffer,
+                            chrs,
                             read, 
                             suppress_aligned,
                             aligned_sai_b,
@@ -274,6 +360,7 @@ void convertSAM(FILE *fp_sam, std::vector<read2Bit_t> &reads, uint32_t *sai, cha
         for (uint32_t j = 0; j < aligned_num_f; j++){
             writeSAMFields(bytes, 
                             buffer,
+                            chrs,
                             read,
                             suppress_aligned,
                             aligned_sai_b,

@@ -5,6 +5,7 @@
 #include <omp.h>
 
 #include "reads.h"
+#include "format.h"
 #include "fm-sa-def.h"
 
 #define POS_BIT 10
@@ -14,6 +15,6 @@
 
 #define ALIGN_REPORT_NUM 16
 
-void convertSAM(FILE *fp_sam, std::vector<read2Bit_t> &reads, uint32_t *sai, char *buffer);
+void convertSAM(FILE *fp_sam, std::vector<read2Bit_t> &reads, uint32_t *sai, char *buffer, std::vector<chr_t> &chrs);
 
 #endif

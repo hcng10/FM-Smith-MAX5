@@ -40,7 +40,7 @@ int main(int argc, char *argv[]) {
     string ext = "ral";
 
     // variables for file
-    //FILE * N_fp = NULL;
+    FILE * N_fp = NULL;
     FILE * FM_fp = NULL;
     FILE * FM_meta_fp = NULL;
 
@@ -48,7 +48,10 @@ int main(int argc, char *argv[]) {
     //FILE * FM_fp_rev = NULL;
     //FILE * FM_meta_fp_rev = NULL;
 
-    FILE * FM_SA = NULL;
+    FILE * SA_fp = NULL;
+    //FILE * rev_SA_fp = NULL;
+
+    FILE * chr_fp = NULL;
 
     FILE * in_fp = NULL;
     FILE * out_fp = NULL;
@@ -75,6 +78,14 @@ int main(int argc, char *argv[]) {
     // suffix array
     uint32_t * sai;
 
+    // number of chromosomes
+    vector<chr_t> chrs;
+    uint16_t chrs_num;
+    
+    // N char info
+    //vector<nchar_cluster_t> nchar_clusters;
+    uint64_t N_cluster;
+
 #if IS_SIM == 0
     // program usage
     if (argc != 3) {
@@ -93,7 +104,8 @@ int main(int argc, char *argv[]) {
     string s7 = string(argv[1]) + ".7." + ext;
     string s8 = string(argv[1]) + ".8." + ext;
 
-
+    string s9 = string(argv[1]) + ".9." + ext;
+    string s10 = string(argv[1]) + ".10." + ext;
 
     cout<<"Read file name: "<<argv[1]<<"\n";
 
@@ -110,6 +122,9 @@ int main(int argc, char *argv[]) {
 
     string s7 = argv_1 + ".7." + ext;
     string s8 = argv_1 + ".8." + ext;
+
+    string s9 = argv_1 + ".9." + ext;
+    string s10 = argv_1 + ".10." + ext;
 
 #endif
     string r1 = "em2w.fq";
@@ -130,7 +145,9 @@ int main(int argc, char *argv[]) {
                 &is32bit, 
                 &bucket_bwt_len,
                 &end_char_pos, 
-                &bucket_pad_size);
+                &bucket_pad_size,
+                &N_cluster,
+                &chrs_num);
 
 
     n_buckets = CEIL(fmt_len, bucket_bwt_len);
@@ -139,19 +156,51 @@ int main(int argc, char *argv[]) {
     printf("FINISH ---> Reading meta data\n\n");fflush(stdout);
 
 
+    
+
     // read SA
     printf("Reading SA ... \n");fflush(stdout);
 
-    openFile(&FM_SA, s7, "r");
+    openFile(&SA_fp, s7, "r");
     
     sai = new uint32_t[fmt_len];
-    if (fread(sai, sizeof(uint32_t), fmt_len, FM_SA) != fmt_len) {
+
+    for (uint32_t i = 0; i < fmt_len; i++){
+        size_t sizeread = fread(&sai[i], 1, sizeof(uint32_t), SA_fp);
+        if (sizeread != sizeof(uint32_t)) {
+            fprintf(stderr, "error: unable to read SA file!\n");
+            exit(1);
+        }
+    }
+    /*if (fread(sai, sizeof(uint32_t), fmt_len, SA_fp) != fmt_len) {
         fprintf(stderr, "error: unable to read SA file!\n");
         exit(1);
-    }
+    }*/
 
-    fclose(FM_SA);
+    fclose(SA_fp);
     printf("FINISH ---> Reading SA\n\n");
+
+
+
+    // read N char info
+    //printf("Reading N char info in reference ... \n");fflush(stdout);
+
+    //openFile(&N_fp, s3, "r");
+    //readNinfo(N_fp, N_cluster, nchar_clusters);
+
+    //fclose(N_fp);
+    //printf("FINISH ---> Reading N char info\n\n");
+
+
+    // read the name of chromosome
+    printf("Reading the name of chromosome ... \n");fflush(stdout);
+
+    openFile(&chr_fp, s9, "r");
+    readChrName(chr_fp, chrs_num, chrs);
+
+    fclose(chr_fp);
+    printf("FINISH ---> Reading name of chromosome\n\n");
+
 
 
     printf("Reading index ... \n"); fflush(stdout);
@@ -254,6 +303,7 @@ int main(int argc, char *argv[]) {
     //writeIndex_thread.join();
     printf("FINISH ---> Writing index\n\n"); fflush(stdout);
 
+
     printf("Aligning reads and Loading more short reads ... \n"); fflush(stdout);
 
 
@@ -315,7 +365,8 @@ int main(int argc, char *argv[]) {
         			sam_fp,
 					std::ref(reads1),
 					sai,
-					sam_buff);
+					sam_buff,
+					std::ref(chrs));
 
                 aligned_cnt1 = aligned_cnt1 + writeReads(out_fp, reads1, out_buff);
                 N_cnt1 = N_cnt1 + writeReadsN(outN_fp, reads3, out_buff);
@@ -361,7 +412,8 @@ int main(int argc, char *argv[]) {
         			sam_fp,
 					std::ref(reads2),
 					sai,
-					sam_buff);
+					sam_buff,
+					std::ref(chrs));
 
         		aligned_cnt2 = aligned_cnt2 + writeReads(out_fp, reads2, out_buff);
         		N_cnt2 = N_cnt2 + writeReadsN(outN_fp, reads4, out_buff);
@@ -384,6 +436,7 @@ int main(int argc, char *argv[]) {
     }
     loadread_thread.join();
 
+
     printf("processed %lu reads\n", cnt + N_cnt1  + N_cnt2);
     printf("aligned %lu reads (file write)\n", aligned_cnt1 + aligned_cnt2);
     printf("aligned %lu reads (alignment)\n", bmk2.aligned_cnt  + bmk1.aligned_cnt);
@@ -405,19 +458,16 @@ int main(int argc, char *argv[]) {
 	fclose(outN_fp);
     fclose(sam_fp);
 
+    
+    //delete [] in_buff;cerr<<"chk1\n";
+    //delete [] out_buff;
+    delete [] sam_buff;
+    delete [] index32;
+
+    delete [] sai;
+
 
     //align(reads1, cnt32, index32, n_buckets * BUCKET_SIZE, cnt32[FM_BP_RANGE], bucket_bwt_len, end_char_pos);
-
-    /*printf("Aligned reads ... \n");
-    for (uint32_t i = 0; i < reads1.size(); i++) {
-    	//if (i == 230){
-    		printf("%u: %s %d ", i, reads1[i].seq, reads1[i].seq_len);
-    		//for (int j=0; j< reads1[i].seq_len; j++){
-    			//printf("%i", charToBin(reads1[i].seq[j]));
-    		//}
-    		printf(" is_aligned: %i: \n", reads1[i].is_align); fflush(stdout);
-    	//}
-    }*/
 
 
 }

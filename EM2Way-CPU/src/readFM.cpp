@@ -13,7 +13,9 @@ void read_meta(FILE * FM_meta_fp,
                 bool * c32, 
                 uint32_t * bucket_bwt_len,
 		        uint64_t * endCharPos, 
-                uint32_t * bucket_pad_size) {
+                uint32_t * bucket_pad_size,
+                uint64_t * N_cluster,
+                uint16_t * chrs_num) {
 
     uint32_t BP_bit;
     uint32_t BP_range;
@@ -46,6 +48,9 @@ void read_meta(FILE * FM_meta_fp,
 
     readFile(FM_meta_fp, c32, sizeof(bool));
     readFile(FM_meta_fp, bucket_bwt_len, sizeof(uint32_t));
+
+    readFile(FM_meta_fp, N_cluster, sizeof(uint64_t));
+    readFile(FM_meta_fp, chrs_num, sizeof(uint16_t));
 
     readFile(FM_meta_fp, bucket_pad_size, sizeof(uint32_t));
 

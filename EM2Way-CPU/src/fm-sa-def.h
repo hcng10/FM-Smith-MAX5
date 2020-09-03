@@ -25,6 +25,7 @@
 #define BURST_BYTES 64
 #define LATENCY 384
 
+
 // round up division
 #define CEIL(a, b) (((a)+(b)-1)/(b))
 

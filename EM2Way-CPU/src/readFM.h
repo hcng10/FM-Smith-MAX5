@@ -26,6 +26,8 @@ void read_meta(FILE * FM_meta_fp,
                 bool * c32, 
                 uint32_t * bucket_bwt_len,
 		        uint64_t * endCharPos, 
-                uint32_t * bucket_pad_size);
+                uint32_t * bucket_pad_size,
+                uint64_t * N_cluster,
+                uint16_t * chrs_num);
 
 #endif /* READFM_H_ */
