@@ -462,7 +462,7 @@ int main(int argc, char *argv[]) {
     //delete [] in_buff;cerr<<"chk1\n";
     //delete [] out_buff;
     delete [] sam_buff;
-    delete [] index32;
+    //delete [] index32;
 
     delete [] sai;
 

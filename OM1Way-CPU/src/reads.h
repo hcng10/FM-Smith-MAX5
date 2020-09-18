@@ -30,9 +30,11 @@ struct hit_t {
 	uint32_t high_sorted[N_HITS];
 	char mis_sym_sorted[N_HITS];
 	char qs_sorted[N_HITS];
+    uint32_t is_aligned_bck;
 	uint8_t id;
 	uint8_t n_hits;
-	uint8_t pad;
+    bool is_rev_cmpt;
+	//uint8_t pad;
 };
 
 

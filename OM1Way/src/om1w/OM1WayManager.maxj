@@ -25,7 +25,7 @@ public class OM1WayManager extends MAX5CManager {
 	public static final String OMKernelName = "OMKernel";
 	public static final String MemCmdKernelName = "CmdKernel";
 	
-	private static final int N_KRNL = 1;
+	private static final int N_KRNL = 3;
 
 	public OM1WayManager(EngineParameters params) {
 		super(params);

@@ -21,14 +21,14 @@
 //160000000
 
 #define N_DFE 1
-#define N_KRNL 1
+#define N_KRNL 3
 #define BURST_BYTES 64
 #define LATENCY 368
 
 // Num of bits for each QS, and the sft reg for hits
 #define FM_QS_BIT 6
 #define N_HITS 32
-#define HIT_PAD 128 - 8 - 32
+#define HIT_PAD 128 - 8 - 32 - 32
 
 // round up division
 #define CEIL(a, b) (((a)+(b)-1)/(b))

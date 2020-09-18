@@ -57,9 +57,15 @@ void writeAligned(FILE *fp, std::vector<read2Bit_t> &reads, char *buffer){
 				writeFile(fp, buffer, bytes);
 				bytes = 0;
 			}
-			// FORMAT: ReadID NumberofHit low0 high0 mispos0 missym0 qs0 low1 ...
+			// FORMAT: ReadID readname seq qs NumberofHit rev_cmpt? backword? low0 high0 mispos0 missym0 qs0   rev_cmpt? backword? low1 ...
 			// write read name
 			writeAlignedStr(bytes, buffer, (void *)(read.at_line.c_str()+1), read.at_line.size()-1);
+			buffer[bytes++] = ' ';
+
+			writeAlignedStr(bytes, buffer, (void *)(read.seq), read.seq_len);
+			buffer[bytes++] = ' ';
+
+			writeAlignedStr(bytes, buffer, (void *)(read.q_score.c_str()), read.seq_len);
 			buffer[bytes++] = ' ';
 
 			tmp_val = (uint32_t) n_hits;
@@ -69,6 +75,14 @@ void writeAligned(FILE *fp, std::vector<read2Bit_t> &reads, char *buffer){
 			// get all the hit details <32
 			for (uint8_t h = 0; h < read.hits.size(); h++){
 				for (uint8_t hi = 0; hi < read.hits[h].n_hits; hi++){
+
+					tmp_val = (uint32_t)read.hits[h].is_rev_cmpt;
+					writeAlignedVal(bytes, buffer, &tmp_val, 1);
+					buffer[bytes++] = ' ';
+
+					tmp_val = (read.hits[h].is_aligned_bck >> (N_HITS-1-hi)) & 1;
+					writeAlignedVal(bytes, buffer, &tmp_val, 1);
+					buffer[bytes++] = ' ';
 
 					tmp_val = read.hits[h].low_sorted[N_HITS-1-hi];
 					writeAlignedVal(bytes, buffer, &tmp_val, POS_BIT);

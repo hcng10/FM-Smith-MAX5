@@ -39,7 +39,7 @@ public class OMKernel extends Kernel {
 	private static final int N_HITS = 32;// Minimum 4, to make qs, misSym to be multiple of 8
 	private static final int N_HITS_BIT = 6;
 	
-	private static final int HIT_PAD = 128 - 8 - 32;
+	private static final int HIT_PAD = 128 - 8 - 32 - 32;
 	
 	// alignment hit score
 	DFEVectorType<DFEVar> misPos_sorted_t = new DFEVectorType<DFEVar>(dfeUInt(8), N_HITS);
@@ -47,9 +47,10 @@ public class OMKernel extends Kernel {
 	DFEVectorType<DFEVar> high_sorted_t = new DFEVectorType<DFEVar>(dfeUInt(32), N_HITS);
 	// store the quality score and missing sym together, to make 8 bits
 	DFEVectorType<DFEVar> qs_misSym_sorted_t = new DFEVectorType<DFEVar>(dfeUInt(8), N_HITS);
+	DFEVectorType<DFEVar> is_aligned_bck_t = new DFEVectorType<DFEVar>(dfeUInt(1), N_HITS);
 	
 	// internal sft registers, wouldn't be output
-	DFEVectorType<DFEVar> qs_sorted_t = new DFEVectorType<DFEVar>(dfeUInt(2+6), N_HITS);
+//DFEVectorType<DFEVar> qs_sorted_t = new DFEVectorType<DFEVar>(dfeUInt(2+6), N_HITS);
 //DFEVectorType<DFEVar> misSym_sorted_t = new DFEVectorType<DFEVar>(dfeUInt(2), N_HITS);
 	
 	// The pattern is:
@@ -60,6 +61,7 @@ public class OMKernel extends Kernel {
 				sft("lowSorted", low_sorted_t),
 				sft("highSorted", high_sorted_t),
 				sft("qsMisSymSorted", qs_misSym_sorted_t),
+				sft("isAlignedBck", is_aligned_bck_t),
 //sft("qsSorted", qs_sorted_t),
 //sft("misSymSorted", misSym_sorted_t),
 			sft("id", dfeUInt(32)),
@@ -371,6 +373,9 @@ public class OMKernel extends Kernel {
 		DFEVector<DFEVar> qsMisSymSortedBuffed = qs_misSym_sorted_t.newInstance(this);
 		DFEVector<DFEVar> qsMisSymSorted = inputCtrl === true ? constant.vect(N_HITS, dfeUInt(8), 0): qsMisSymSortedBuffed;
 		
+		DFEVector<DFEVar> isAlignedBckBuffed = is_aligned_bck_t.newInstance(this);
+		DFEVector<DFEVar> isAlignedBck = inputCtrl === true ? constant.vect(N_HITS, dfeUInt(1), 0): isAlignedBckBuffed;
+		
 		
 //DFEVector<DFEVar> qsSortedBuffed = qs_sorted_t.newInstance(this);
 //DFEVector<DFEVar> qsSorted = inputCtrl === true ? constant.vect(N_HITS, dfeUInt(6), 0): qsSortedBuffed;
@@ -384,6 +389,7 @@ public class OMKernel extends Kernel {
 									lowNew, lowSorted,
 									highNew, highSorted,
 									qsMisNew, hitMisSymValNew, qsMisSymSorted, 
+									isAlignedBck,
 //qsSorted,
 //qsMisNew, qsSorted, 
 //qsMisSymValNew, misSymSorted,
@@ -394,6 +400,7 @@ public class OMKernel extends Kernel {
 		DFEVector<DFEVar> lowSortedNew = hitScore.get("lowSorted");
 		DFEVector<DFEVar> highSortedNew = hitScore.get("highSorted");
 		DFEVector<DFEVar> qsMisSymSortedNew = hitScore.get("qsMisSymSorted");
+		DFEVector<DFEVar> isAlignedBckNew = hitScore.get("isAlignedBck");
 		
 //DFEVector<DFEVar> qsSortedNew = hitScore.get("qsSorted");
 //DFEVector<DFEVar> misSymSortedNew = hitScore.get("misSymSorted");
@@ -436,6 +443,7 @@ public class OMKernel extends Kernel {
 		lowSortedBuffed <== stream.offset(lowSortedNew, -offset, -432, -320);
 		highSortedBuffed <== stream.offset(highSortedNew, -offset, -432, -320);
 		qsMisSymSortedBuffed <== stream.offset(qsMisSymSortedNew, -offset, -432, -320);
+		isAlignedBckBuffed <== stream.offset(isAlignedBckNew, -offset, -432, -320);
 		
 //qsSortedBuffed <== stream.offset(qsSortedNew, -offset, -432, -320);
 //misSymSortedBuffed <== stream.offset(misSymSortedNew, -offset, -432, -320);
@@ -638,7 +646,8 @@ public class OMKernel extends Kernel {
 	private DFEStruct shfQS(DFEVar misPos, DFEVector<DFEVar> misPosSorted,
 							DFEVar low, DFEVector<DFEVar> lowSorted,
 							DFEVar high, DFEVector<DFEVar> highSorted,
-							DFEVar misQSVal, DFEVar misSymVal, DFEVector<DFEVar> qsMisSymSorted,//DFEVector<DFEVar> misSymSorted,
+							DFEVar misQSVal, DFEVar misSymVal, DFEVector<DFEVar> qsMisSymSorted,
+							DFEVector<DFEVar> isAlignedBck,
 							DFEVar isHit, DFEVar hitCnt,
 							DFEVar phase, DFEVar len, DFEVar id){
 		
@@ -664,6 +673,8 @@ public class OMKernel extends Kernel {
 		DFEVector<DFEVar> lowSortedNew = low_sorted_t.newInstance(this);
 		DFEVector<DFEVar> highSortedNew = high_sorted_t.newInstance(this);
 		DFEVector<DFEVar> qsMisSymSortedNew = qs_misSym_sorted_t.newInstance(this);
+		DFEVector<DFEVar> isAlignedBckNew = is_aligned_bck_t.newInstance(this);
+
 //DFEVector<DFEVar> misSymSortedNew = misSym_sorted_t.newInstance(this);
 		
 //DFEVector<DFEVar> qsSortedNew = qs_sorted_t.newInstance(this);
@@ -689,7 +700,10 @@ public class OMKernel extends Kernel {
 				(i === instPos-1)? misSymVal.cat(misQSVal).cast(dfeUInt(8))  :
 				(i < instPos - 1)? qsMisSymSorted[i+1]: qsMisSymSorted[i];	
 				
-
+			isAlignedBckNew[i] <== (instPos === 0 | isHit === false)? isAlignedBck[i]:
+							(i === instPos-1)? 
+									(phase === 0)? constant.var(dfeUInt(1), 1):constant.var(dfeUInt(1),0):
+							(i < instPos - 1)? isAlignedBck[i+1]: isAlignedBck[i];	
 /*qsSortedNew[i] <== (instPos === 0 | isHit === false)? qsSorted[i]:
 				(i === instPos-1)? misQSVal:
 				(i < instPos - 1)? qsSorted[i+1]: qsSorted[i];	*/
@@ -698,13 +712,16 @@ public class OMKernel extends Kernel {
 				(i === instPos-1)? misSymVal:
 				(i < instPos - 1)? misSymSorted[i+1]: misSymSorted[i];*/
 
-
+							
 		}
 		// the boundary condition
 		misPosSortedNew[N_HITS-1] <== (instPos === N_HITS & isHit === true )? misPosPhased: misPosSorted[N_HITS-1];
 		lowSortedNew[N_HITS-1] 	<== (instPos === N_HITS & isHit === true )? low: lowSorted[N_HITS-1];
 		highSortedNew[N_HITS-1] <== (instPos === N_HITS & isHit === true )? high: highSorted[N_HITS-1];
 		qsMisSymSortedNew[N_HITS-1] <== (instPos === N_HITS & isHit === true )? misSymVal.cat(misQSVal).cast(dfeUInt(8)): qsMisSymSorted[N_HITS-1];
+		isAlignedBckNew[N_HITS-1] <== (instPos === N_HITS & isHit === true )? 
+				(phase === 0)? constant.var(dfeUInt(1), 1):constant.var(dfeUInt(1),0)
+				: isAlignedBck[N_HITS-1];
 //qsSortedNew[N_HITS-1] 	<== (instPos === N_HITS & isHit === true )? misQSVal: qsSorted[N_HITS-1];
 //misSymSortedNew[N_HITS-1] <== (instPos === N_HITS & isHit === true )? misSymVal: misSymSorted[N_HITS-1];
 		
@@ -714,6 +731,7 @@ public class OMKernel extends Kernel {
 		hitScore.set("lowSorted", lowSortedNew);
 		hitScore.set("highSorted", highSortedNew);
 		hitScore.set("qsMisSymSorted", qsMisSymSortedNew);
+		hitScore.set("isAlignedBck", isAlignedBckNew);
 //hitScore.set("qsSorted", qsSortedNew);
 		hitScore.set("pad", constant.var(dfeUInt(HIT_PAD), 0));
 		

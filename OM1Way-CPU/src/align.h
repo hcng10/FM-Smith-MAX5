@@ -19,6 +19,8 @@
 #include "fm-sa-def.h"
 #include "Maxfiles.h"
 
+#include <bitset>
+
 
 
 
@@ -58,6 +60,7 @@ struct out_t {
 	uint8_t qs_mis_sym_sorted[N_HITS];
 	//uint16_t qs_sorted[(N_HITS*FM_QS_BIT)/(sizeof(uint16_t)*8)];
 	//uint8_t mis_sym_sorted[(N_HITS*FM_BP_BIT)/(sizeof(uint8_t)*8)];
+	uint32_t is_aligned_bck; // is a bitwise array
 	uint32_t id;
 	uint8_t n_hits;
 	uint8_t pad[(HIT_PAD)/(sizeof(uint8_t)*8)];

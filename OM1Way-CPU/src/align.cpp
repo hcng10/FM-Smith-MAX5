@@ -129,7 +129,7 @@ void writeIndex(index32_t * index, uint64_t index_bytes, uint64_t offset, fpga_t
 	return;
 }
 
-void parse_result(uint32_t * part_size,
+void parse_result(bool is_rev_cmpt, uint32_t * part_size,
 				std::vector<read2Bit_t> &reads,
                 out_t **out,
 				bmk_t * bmk){
@@ -152,9 +152,11 @@ void parse_result(uint32_t * part_size,
 			if (n_hits == 0) continue;
 
 			tmp.n_hits = n_hits;
+			tmp.is_rev_cmpt = is_rev_cmpt;
 	    	memcpy(tmp.mis_pos_sorted, out[i][j].mis_pos_sorted, sizeof(tmp.mis_pos_sorted));
 	    	memcpy(tmp.low_sorted, out[i][j].low_sorted, sizeof(tmp.low_sorted));
 	    	memcpy(tmp.high_sorted, out[i][j].high_sorted, sizeof(tmp.high_sorted));
+			memcpy(&tmp.is_aligned_bck, &out[i][j].is_aligned_bck, sizeof(tmp.is_aligned_bck));
 
 	    	for (uint8_t k = 0; k < n_hits; k++){
 	    	    uint8_t tmp_qs_mis_sym = out[i][j].qs_mis_sym_sorted[N_HITS-1-k];
@@ -165,10 +167,12 @@ void parse_result(uint32_t * part_size,
 	    	    //printf("Missym %c, QS %d \n", tmp.mis_sym_sorted[N_HITS-1-k], tmp.qs_sorted[N_HITS-1-k]);
 
 	    	}
-			//cout<<j<<" id: "<<id<<" n_hits "<<(int)n_hits<<" "<<(int)tmp.mis_pos_sorted[0]<<
-				//" "<<(int)tmp.mis_pos_sorted[31]<<"\n"<<
-				//(int)tmp.low_sorted[31]<<" "<<(int)tmp.high_sorted[31]<<" "<<
-				//(char)tmp.mis_sym_sorted[31]<<" "<<(char)(tmp.qs_sorted[31])<<"\n";
+				/*cout<<j<<" id: "<<reads[id].at_line<<" n_hits "<<(int)n_hits<<" "<<(int)tmp.mis_pos_sorted[0]<<
+				" "<<(int)tmp.mis_pos_sorted[31]<<"\n"<<
+				(int)tmp.low_sorted[31]<<" "<<(int)tmp.high_sorted[31]<<" "<<
+				(char)tmp.mis_sym_sorted[31]<<" "<<(char)(tmp.qs_sorted[31])<<"\n";
+
+				std::cout << "is_aligned_bck = " << std::bitset<32>(tmp.is_aligned_bck)<<"\n";*/
 
 	    	reads[id].n_hits = reads[id].n_hits + n_hits;
 	    	reads[id].is_align = n_hits > 0? true: false;
@@ -326,8 +330,8 @@ void align(std::vector<read2Bit_t> &reads,
 
 	// parse output
 	printf("\tparsing results and alignment from forward direction... "); fflush(stdout);
-parse_result(part_size, reads, out1, bmk);
-	//parse_thread = std::thread(parse_result, part_size, std::ref(reads), out1, std::ref(bmk));
+
+	parse_thread = std::thread(parse_result, false, part_size, std::ref(reads), out1, std::ref(bmk));
 
 	actionAlign(in,
 				part_size,
@@ -340,11 +344,11 @@ parse_result(part_size, reads, out1, bmk);
 				end_char_bucketi_rev,
 				out2, true, fpga_var.engine, bmk);
 
-	//parse_thread.join();
+	parse_thread.join();
 
 	printf("\tparsing final results ... \n"); fflush(stdout);
 
-	parse_result(part_size, reads, out2, bmk);
+	parse_result(true, part_size, reads, out2, bmk);
 
 
 	// cleanup

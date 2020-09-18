@@ -14,7 +14,7 @@
 #include "aligned_rslt.h"
 #include "fm-sa-def.h"
 
-#define IS_SIM 1
+#define IS_SIM 0
 
 using namespace std;
 
@@ -119,8 +119,6 @@ int main(int argc, char *argv[]) {
 
     string s9 = argv_1 + ".9." + ext;
     string s10 = argv_1 + ".10." + ext;
-
-    
 
 #endif
 
@@ -397,6 +395,8 @@ int main(int argc, char *argv[]) {
 
     delete [] index32;
     delete [] aligned_buff;
+    delete [] in_buff;
+    delete [] out_buff;
 
 	return 0;
 }
