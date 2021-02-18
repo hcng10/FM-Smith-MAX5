@@ -39,7 +39,7 @@ public class OM1WayManager extends MAX5CManager {
 		
 		//build config
 		ManagerConfiguration config = this.getManagerConfig();
-	    config.setStreamClockFrequencyMHz(200);
+	    config.setStreamClockFrequencyMHz(250);
 	    
 	    LMemGlobalConfig memConfig = this.getLMemGlobalConfig();
 	    memConfig.setMemoryFrequency(LMemFrequency.LMEM_1200MHZ); 

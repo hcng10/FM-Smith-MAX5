@@ -16,5 +16,10 @@
 #define ALIGN_REPORT_NUM 16
 
 void convertSAM(FILE *fp_sam, std::vector<read2Bit_t> &reads, uint32_t *sai, char *buffer, std::vector<chr_t> &chrs);
-
+void writePosDirectly(FILE *fp_di, 
+                        std::vector<read2Bit_t> &reads,
+                        uint32_t *sai,
+                        //uint32_t *sai_rev,
+                        std::vector<chr_t> &chrs,
+                        char *   buffer);
 #endif

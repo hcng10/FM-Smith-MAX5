@@ -42,6 +42,11 @@ int main(int argc, char *argv[]) {
     FILE * FM_fp_rev = NULL;
     FILE * FM_meta_fp_rev = NULL;
 
+    FILE * SA_fp = NULL;
+    FILE * rev_SA_fp = NULL;
+
+    FILE * chr_fp = NULL;
+
     FILE *in_fp = NULL;
     FILE *out_fp = NULL;
     FILE *aligned_fp = NULL;
@@ -72,7 +77,12 @@ int main(int argc, char *argv[]) {
     uint32_t cnt32[FM_BP_RANGE + 1] 	= {0};
     uint32_t cnt32_rev[FM_BP_RANGE + 1] = {0};
 
+    // suffix array
+    uint32_t * sai;
+    uint32_t * sai_rev;
+
     // number of chromosomes
+    vector<chr_t> chrs;
     uint16_t chrs_num;
     uint16_t chrs_num_rev;
     
@@ -162,6 +172,53 @@ int main(int argc, char *argv[]) {
     fclose(FM_meta_fp_rev);
 
     printf("FINISH ---> Reading meta data\n\n");fflush(stdout);
+
+
+
+    printf("Reading SA ... \n");fflush(stdout);
+
+    openFile(&SA_fp, s7, "r");
+    
+    sai = new uint32_t[fmt_len];
+
+    for (uint32_t i = 0; i < fmt_len; i++){
+        size_t sizeread = fread(&sai[i], 1, sizeof(uint32_t), SA_fp);
+        if (sizeread != sizeof(uint32_t)) {
+            fprintf(stderr, "error: unable to read SA file!\n");
+            exit(1);
+        }
+    }
+
+    fclose(SA_fp);
+    printf("FINISH ---> Reading SA\n\n");
+
+    printf("Reading SA Reversed ... \n");fflush(stdout);
+
+    openFile(&rev_SA_fp, s8, "r");
+
+    sai_rev = new uint32_t[fmt_len];
+
+    for (uint32_t i = 0; i < fmt_len; i++){
+        size_t sizeread = fread(&sai_rev[i], 1, sizeof(uint32_t), rev_SA_fp);
+        if (sizeread != sizeof(uint32_t)) {
+            fprintf(stderr, "error: unable to read SA file!\n");
+            exit(1);
+        }
+    }
+
+    fclose(rev_SA_fp);
+    printf("FINISH ---> Reading SA Reversed\n\n");
+
+
+    // read the name of chromosome
+    printf("Reading the name of chromosome ... \n");fflush(stdout);
+
+    openFile(&chr_fp, s9, "r");
+    readChrName(chr_fp, chrs_num, chrs);
+
+    fclose(chr_fp);
+    printf("FINISH ---> Reading name of chromosome\n\n");
+
 
 
     //** read index
@@ -310,10 +367,17 @@ int main(int argc, char *argv[]) {
 			            fpga_var, &bmk1);
 
                 // writing aligned read to a plain text file for later processing
-                writeAligned_thread = std::thread(writeAligned,
+                /*writeAligned_thread = std::thread(writeAligned,
         			aligned_fp,
 					std::ref(reads1),
-					aligned_buff);
+					aligned_buff);*/
+                writeAligned_thread = std::thread(writePosDirectly, 
+                                                aligned_fp, 
+                                                std::ref(reads1),
+                                                sai,
+                                                sai_rev,
+                                                std::ref(chrs),
+                                                aligned_buff);
 
                 aligned_cnt1 = aligned_cnt1 + writeReads(out_fp, reads1, out_buff);
 
@@ -357,10 +421,18 @@ int main(int argc, char *argv[]) {
 			            fpga_var, &bmk2);
 
                 // writing aligned read to a plain text file for later processing
-                writeAligned_thread = std::thread(writeAligned,
+                /*writeAligned_thread = std::thread(writeAligned,
         			aligned_fp,
 					std::ref(reads2),
-					aligned_buff);
+					aligned_buff);*/
+
+                writeAligned_thread = std::thread(writePosDirectly, 
+                                aligned_fp, 
+                                std::ref(reads2),
+                                sai,
+                                sai_rev,
+                                std::ref(chrs),
+                                aligned_buff);
 
 				aligned_cnt2 = aligned_cnt2 + writeReads(out_fp, reads2, out_buff);
 

@@ -261,7 +261,7 @@ public class OMKernel extends Kernel {
 		
 		// handle end char, it is stored at a sym_val === 0
 		DFEVar lowUp = (endCharBucketSel === (low >> BUCKET_BWT_LEN_PWR) & endCharBucketiSel < low_idx
-									& symVal === 0)?  lowUp_unchekEnd - 1: lowUp_unchekEnd;
+									& symNew === 0)?  lowUp_unchekEnd - 1: lowUp_unchekEnd;
 		
 		
 		
@@ -276,7 +276,7 @@ public class OMKernel extends Kernel {
 		
 		// handle end char, it is stored at a sym_val === 0
 		DFEVar highUp = (endCharBucketSel === (high >> BUCKET_BWT_LEN_PWR) & endCharBucketiSel < high_idx 
-									& symVal === 0)? highUp_unchekEnd - 1: highUp_unchekEnd;
+									& symNew === 0)? highUp_unchekEnd - 1: highUp_unchekEnd;
 		
 		
 		// update alignment state

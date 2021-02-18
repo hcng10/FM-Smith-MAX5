@@ -294,7 +294,11 @@ void writeSAMFields(uint64_t &bytes,
 }
 
 
-void convertSAM(FILE *fp_sam, std::vector<read2Bit_t> &reads, uint32_t *sai, char *buffer, std::vector<chr_t> &chrs){
+void convertSAM(FILE *fp_sam, 
+                std::vector<read2Bit_t> &reads, 
+                uint32_t *sai, 
+                char *buffer, 
+                std::vector<chr_t> &chrs){
 
     uint64_t bytes = 0;
     uint32_t aligned_sai_b[ALIGN_REPORT_NUM];
@@ -374,4 +378,81 @@ void convertSAM(FILE *fp_sam, std::vector<read2Bit_t> &reads, uint32_t *sai, cha
     if (bytes > 0) {
         writeFile(fp_sam, buffer, bytes);
     }
+}
+
+void writePosDirectly(FILE *fp_di, 
+                        std::vector<read2Bit_t> &reads,
+                        uint32_t *sai,
+                        //uint32_t *sai_rev,
+                        std::vector<chr_t> &chrs,
+                        char *   buffer){
+
+    uint64_t bytes = 0;
+
+    uint32_t sa_tmp = 0;
+    uint32_t tmp_val = 0;
+    char tmp_char = '0';
+    int chr_idx;
+
+    for (uint32_t i = 0; i < reads.size(); i++) {
+
+        if ((bytes + 1024) > BUFF_SIZE) {
+            writeFile(fp_di, buffer, bytes);
+            bytes = 0;
+        }
+
+        read2Bit_t read = reads[i];
+
+        bool aligned = read.isaligned_bw || read.isaligned_fw;
+
+        if (aligned == true){
+
+            // 1. QNAME
+            writeSAMCStr(bytes, buffer, (void *)(read.at_line.c_str()), read.at_line.size());
+            tmp_char = '\n';
+            writeSAM(bytes, buffer, &tmp_char, 1);
+
+            if (read.isaligned_bw){
+                for (uint32_t j = 0; j < read.high_bw - read.low_bw; j++){
+                    sa_tmp = sai[read.low_bw + j] + 1;
+                    chr_idx = getChrsIdx(sa_tmp, chrs);
+                    writeSAMCStr(bytes, buffer, (void *)(chrs[chr_idx].name.c_str()+1), chrs[chr_idx].name.length()-2);
+                   
+                    tmp_char = ' ';
+                    writeSAM(bytes, buffer, &tmp_char, 1); 
+                    
+                    tmp_val = sa_tmp - chrs[chr_idx].begin;
+                    writeSAMVal(bytes, buffer, &tmp_val, POS_BIT);
+
+                    tmp_char = ' ';
+                    writeSAM(bytes, buffer, &tmp_char, 1); 
+                }
+            }else{
+                for (uint32_t j = 0; j < read.high_fw - read.low_fw; j++){
+                    sa_tmp = sai[read.low_fw + j] + 1;
+                    chr_idx = getChrsIdx(sa_tmp, chrs);
+                    writeSAMCStr(bytes, buffer, (void *)(chrs[chr_idx].name.c_str()+1), chrs[chr_idx].name.length()-2);
+
+                    tmp_char = ' ';
+                    writeSAM(bytes, buffer, &tmp_char, 1); 
+
+                    tmp_val = sa_tmp - chrs[chr_idx].begin;
+                    writeSAMVal(bytes, buffer, &tmp_val, POS_BIT);
+                    
+                    tmp_char = ' ';
+                    writeSAM(bytes, buffer, &tmp_char, 1); 
+                
+                }
+            }
+
+            tmp_char = '\n';
+            writeSAM(bytes, buffer, &tmp_char, 1);
+        
+        }
+    }
+    
+    if (bytes > 0) {
+        writeFile(fp_di, buffer, bytes);
+    }
+
 }

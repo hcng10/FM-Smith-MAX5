@@ -129,7 +129,7 @@ int main(int argc, char *argv[]) {
 #endif
     string r1 = "em2w.fq";
     string r1N = "em2wN.fq";
-    string rs1 = "em2w.sam";
+    string rs1 = "em2w.txt";
 
 
     // load index
@@ -361,12 +361,19 @@ int main(int argc, char *argv[]) {
                         &bmk1);
 
                 // writing aligned read to SAM file
-                writeSAM_thread = std::thread(convertSAM,
+                /*writeSAM_thread = std::thread(convertSAM,
         			sam_fp,
 					std::ref(reads1),
 					sai,
 					sam_buff,
-					std::ref(chrs));
+					std::ref(chrs));*/
+                writeSAM_thread = std::thread(writePosDirectly,
+                    sam_fp,
+                    std::ref(reads1),
+                    sai,
+                    std::ref(chrs),
+                    sam_buff
+                );
 
                 aligned_cnt1 = aligned_cnt1 + writeReads(out_fp, reads1, out_buff);
                 N_cnt1 = N_cnt1 + writeReadsN(outN_fp, reads3, out_buff);
@@ -408,12 +415,20 @@ int main(int argc, char *argv[]) {
 						&bmk2);
                         
                 // writing aligned read to SAM file
-                writeSAM_thread = std::thread(convertSAM,
+                /*writeSAM_thread = std::thread(convertSAM,
         			sam_fp,
 					std::ref(reads2),
 					sai,
 					sam_buff,
-					std::ref(chrs));
+					std::ref(chrs));*/
+
+                writeSAM_thread = std::thread(writePosDirectly,
+                    sam_fp,
+                    std::ref(reads2),
+                    sai,
+                    std::ref(chrs),
+                    sam_buff
+                );
 
         		aligned_cnt2 = aligned_cnt2 + writeReads(out_fp, reads2, out_buff);
         		N_cnt2 = N_cnt2 + writeReadsN(outN_fp, reads4, out_buff);

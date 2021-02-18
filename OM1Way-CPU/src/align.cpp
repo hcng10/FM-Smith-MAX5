@@ -173,7 +173,7 @@ void parse_result(bool is_rev_cmpt, uint32_t * part_size,
 				(char)tmp.mis_sym_sorted[31]<<" "<<(char)(tmp.qs_sorted[31])<<"\n";
 
 				std::cout << "is_aligned_bck = " << std::bitset<32>(tmp.is_aligned_bck)<<"\n";*/
-
+//need to use semaphore to protect it
 	    	reads[id].n_hits = reads[id].n_hits + n_hits;
 	    	reads[id].is_align = n_hits > 0? true: false;
 
