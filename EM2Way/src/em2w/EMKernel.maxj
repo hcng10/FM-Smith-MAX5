@@ -1,0 +1,377 @@
+package em2w;
+
+import static com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEStructType.sft;
+
+import com.maxeler.maxcompiler.v2.kernelcompiler.Kernel;
+import com.maxeler.maxcompiler.v2.kernelcompiler.KernelParameters;
+import com.maxeler.maxcompiler.v2.kernelcompiler.RoundingMode;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.base.DFEVar;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEStruct;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEStructType;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEVector;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEVectorType;
+import com.maxeler.maxcompiler.v2.utils.Bits;
+
+//import java.lang.*;
+
+public class EMKernel extends Kernel {
+	
+	//private static final int BUCKET_BWT_LEN = 192;//based on the burst size of 64
+	private static final int BUCKET_SIZE_BIT = 512;//**CHANGE THIS VAR FOR DIFF BRUST SIZE
+	private static final int MEM_BRUST_CNT = 1;//**CHANGE THIS VAR FOR DIFF BRUST SIZE
+	
+	private static final int BUCKET_CTABLE_BIT = 128;
+	private static final int BUCKET_ITABLE_BIT = BUCKET_SIZE_BIT - BUCKET_CTABLE_BIT;
+	
+	private static final int BUCKET_BWT_LEN_PWR = 
+			(int) (Math.log((double)(BUCKET_ITABLE_BIT/2)) / Math.log(2.0));
+	
+	private static final int MEM_BRUST_CNT_PWR = 
+			(int) (Math.log((double)(MEM_BRUST_CNT)) / Math.log(2.0));
+	
+	private static final int BUCKET_BWT_LEN = 1 << BUCKET_BWT_LEN_PWR;
+	
+	private static final int BP_BITWIDTH = 2;
+	
+	private static final int MAX_READ_LENGTH = 168;
+	private static final int MAX_READ_LENGTH_BIT = 8;
+	
+
+	public EMKernel(final KernelParameters parameters) {
+		super(parameters);
+		
+		System.out.println(BUCKET_BWT_LEN_PWR + " " +BUCKET_BWT_LEN + " " + BUCKET_BWT_LEN/64);
+
+		optimization.pushRoundingMode(RoundingMode.TRUNCATE);
+		
+		DFEVectorType<DFEVar> sym_t = new DFEVectorType<DFEVar>(dfeUInt(2), MAX_READ_LENGTH);
+		
+		// read input
+		DFEStructType in_t = new DFEStructType(
+						       sft("id", dfeUInt(32)),
+						       sft("sym", sym_t),
+						       sft("len", dfeUInt(MAX_READ_LENGTH_BIT)),
+						       sft("isPad", dfeUInt(8))); //8 bits because transferring 1 bit bool is not optimized
+						       
+		// alignment output
+		DFEStructType out_t = new DFEStructType(
+							sft("id", dfeUInt(32)),
+							sft("lowBw", dfeUInt(32)),
+							sft("highBw", dfeUInt(32)),
+							sft("lowFw", dfeUInt(32)),
+							sft("highFw", dfeUInt(32)),
+							sft("isalignedBw", dfeUInt(32)),
+							sft("isalignedFw", dfeUInt(32)),
+							sft("pad", dfeUInt(32)));
+		
+		// memory command
+		DFEStructType memCmd_t = new DFEStructType(
+							   sft("lowAddr", dfeUInt(32)),
+							   sft("highAddr", dfeUInt(32)),
+							   sft("highCtrl", dfeBool()),
+							   sft("valid", dfeBool()));
+		
+		
+		// kernel control counters
+		DFEVar offset = io.scalarInput("offset", dfeInt(32));
+		DFEVar tickCount = control.count.simpleCounter(32, offset.cast(dfeUInt(32)));
+		DFEVar tickInit = control.count.pulse(1, tickCount === offset.cast(dfeUInt(32)) - 1);
+			
+		
+		// input stream control
+		DFEVar inputCtrlPostBuffed = dfeBool().newInstance(this);
+		DFEVar inputCtrl = tickInit === 1 ? constant.var(true) : inputCtrlPostBuffed;
+		
+		DFEVar highMemCtrlPostBuffed = dfeBool().newInstance(this);
+		DFEVar highMemCtrl = inputCtrl === true ? constant.var(false): highMemCtrlPostBuffed;
+		
+
+		
+		// kernel input
+		// ---pci-e
+		DFEStruct readIn = io.input("readIn", in_t, inputCtrl === true);
+		
+		DFEVar highInit = io.scalarInput("highInit", dfeUInt(32));
+		
+		DFEVar endCharBucket = io.scalarInput("endCharBucket", dfeUInt(32));	
+		DFEVar endCharBucketi = io.scalarInput("endCharBucketi", dfeUInt(32));
+
+		
+		//---DDR
+		DFEVar lowBucket = io.input("lowIndex", dfeRawBits(BUCKET_SIZE_BIT), inputCtrl === false);
+		DFEVar highBucket = io.input("highIndex", dfeRawBits(BUCKET_SIZE_BIT), highMemCtrl === true);
+		
+		// ---pci-e
+		// set up streams
+		DFEVar idIn = readIn.get("id");
+		DFEVar idBuffed = dfeUInt(32).newInstance(this);
+		DFEVar id = inputCtrl === true ? idIn : idBuffed;
+		
+		DFEVector<DFEVar> symIn = readIn.get("sym");
+		DFEVector<DFEVar> symBuffed = sym_t.newInstance(this);
+		DFEVector<DFEVar> sym = inputCtrl === true ? symIn : symBuffed;
+		
+		DFEVar lenIn = readIn.get("len");
+		DFEVar lenBuffed = dfeUInt(MAX_READ_LENGTH_BIT).newInstance(this);
+		DFEVar len = inputCtrl === true ? lenIn : lenBuffed;
+		
+		DFEVar isPadIn = readIn.get("isPad");
+		DFEVar isPadBuffed = dfeUInt(8).newInstance(this);
+		DFEVar isPad = inputCtrl === true ? isPadIn : isPadBuffed;
+		
+		DFEVar low = dfeUInt(32).newInstance(this);
+		DFEVar high = dfeUInt(32).newInstance(this);
+		
+		// stream for the results
+		DFEVar phaseBuffed = dfeUInt(2).newInstance(this);
+		DFEVar phase = inputCtrl === true ? constant.var(dfeUInt(2), 0) : phaseBuffed;//phase 2
+		
+		DFEVar lowBwBuffed = dfeUInt(32).newInstance(this);
+		DFEVar lowBw = inputCtrl === true ? constant.var(dfeUInt(32), 0) : lowBwBuffed;
+		
+		DFEVar highBwBuffed = dfeUInt(32).newInstance(this);
+		DFEVar highBw = inputCtrl === true ? constant.var(dfeUInt(32), 0) : highBwBuffed;
+		
+		
+		
+		// ---The index within a read
+		DFEVar idxBuffed = dfeUInt(8).newInstance(this);
+		DFEVar idx = inputCtrl === true ? constant.var(dfeUInt(8), 0) : idxBuffed;
+		
+		// get read symbols
+		DFEVar symIdx = phase === 0 ? idx : len-idx-1;//phase 2
+		DFEVar symValPrimitive = control.mux(symIdx, sym.getElementsAsList());//phase 2
+		
+		//A-T, C->G
+		DFEVar reverseCmpt = symValPrimitive === constant.var(dfeUInt(2), 0) ? constant.var(dfeUInt(2), 3):
+								symValPrimitive === constant.var(dfeUInt(2), 1) ? constant.var(dfeUInt(2), 2):
+								symValPrimitive === constant.var(dfeUInt(2), 2) ? constant.var(dfeUInt(2), 1):
+												constant.var(dfeUInt(2), 0);
+			
+		DFEVar symVal  =  phase === 0 ? symValPrimitive: reverseCmpt;//phase 2
+		
+		// initialise SA interval
+		DFEVar lowInit = constant.var(dfeUInt(32), 0);
+		
+
+		// ---update SA interval, the data should be available from DDR
+		// handle low count
+		DFEVar lowCCount = getCount_Ctable(symVal, lowBucket);
+		
+		DFEVar low_idx = low & (BUCKET_BWT_LEN-1);// mod to calculate the offset within the bucket
+		DFEVar lowICount = getCount_Itable(symVal, lowBucket, low_idx);
+		
+		DFEVar lowUp_unchekEnd = lowCCount + lowICount.cast(dfeUInt(32));
+		
+		// handle end char, it is stored at a sym_val === 0
+		DFEVar lowUp = (endCharBucket === (low >> BUCKET_BWT_LEN_PWR) & endCharBucketi < low_idx
+									& symVal === 0)?  lowUp_unchekEnd - 1: lowUp_unchekEnd;
+		
+		// handle high count
+		DFEVar highCCount = highMemCtrl === true ?  
+				getCount_Ctable(symVal, highBucket) : lowCCount;
+		
+		//TODO: not generalized for this line 
+		DFEVar high_idx = high & (BUCKET_BWT_LEN-1);
+		DFEVar highICount = highMemCtrl === true ? 
+				getCount_Itable(symVal, highBucket, high_idx) : getCount_Itable(symVal, lowBucket, high_idx);
+		
+		DFEVar highUp_unchekEnd = highCCount + highICount.cast(dfeUInt(32));
+		
+		// handle end char, it is stored at a sym_val === 0
+		DFEVar highUp = (endCharBucket === (high >> BUCKET_BWT_LEN_PWR) & endCharBucketi < high_idx 
+									& symVal === 0)? highUp_unchekEnd - 1: highUp_unchekEnd;
+
+		
+		
+		// update alignment state
+		// --- check if it is the first char 
+		// PrePost means it is used before and after the pulse signal, 0 (before) and the updated value for lowUp (after)
+		DFEVar lowNew = inputCtrl === true ? constant.var(dfeUInt(32), 0) : lowUp;
+		DFEVar highNew = inputCtrl === true ? highInit : highUp;
+		
+		DFEVar isAligning =  lowNew < highNew ? constant.var(true) : constant.var(false);
+		
+		DFEVar idxNew = inputCtrl === true ? idx : idx + 1;
+		//DFEVar shift = inputCtrl === true ? 0 : constant.var(dfeUInt(8), 1);//phase 2
+		//DFEVector<DFEVar> symShifted = sym.shiftElementsRight(shift);//phase 2
+			
+		
+		
+		//---handle the last position, and determine if the search has to be done from reverse compliment
+		DFEVar halfSearchEnd    = ((idxNew === len) | (isAligning === false)) & (isPad === 0) ? 
+		                            constant.var(true) : constant.var(false);//phase 2
+        DFEVar phaseNew         = halfSearchEnd ? phase + 1: phase;//phase 2
+		DFEVar lowNew_phased    = halfSearchEnd ? lowInit: lowNew;//phase 2
+		DFEVar highNew_phased   = halfSearchEnd ? highInit: highNew;//phase 2
+		DFEVar idxNew_phased    = halfSearchEnd ?  0: idxNew;//phase 2
+        
+        DFEVar inputCtrlPost    = phaseNew === 2 ? constant.var(true) : constant.var(false);
+        
+        DFEVar lowBwNew 	= (halfSearchEnd === 1 & phase === 0) ? lowNew : lowBw;
+        DFEVar highBwNew 	= (halfSearchEnd === 1 & phase === 0) ? highNew : highBw;        
+        
+        
+		//---generate new memory command (shifted by bucket_bwt_len)
+		//DFEVar lowNewAddr   = phaseNew !== 0 ? readOffset + (lowNew_phased >> BUCKET_BWT_LEN_PWR): (lowNew_phased >> BUCKET_BWT_LEN_PWR);//phase 2
+	 	//DFEVar highNewAddr  = phaseNew !== 0 ? readOffset + (highNew_phased >> BUCKET_BWT_LEN_PWR): (highNew_phased >> BUCKET_BWT_LEN_PWR);//phase 2
+		DFEVar lowNewAddr = (lowNew_phased >> BUCKET_BWT_LEN_PWR) << (MEM_BRUST_CNT_PWR) ;//phase 2
+	 	DFEVar highNewAddr = (highNew_phased >> BUCKET_BWT_LEN_PWR)  << (MEM_BRUST_CNT_PWR) ;//phase 2
+	 	
+		//DFEVar inputCtrlPost = ((idxNew === len) | (isAligning === false)) & (isPad === 0) ? 
+				//constant.var(true) : constant.var(false);
+		DFEVar highMemCtrlPost = (lowNewAddr !== highNewAddr) & inputCtrlPost === false? 
+				constant.var(true) : constant.var(false);
+		
+		DFEStruct memCmd = memCmd_t.newInstance(this);
+		
+		memCmd.set("lowAddr", lowNewAddr);
+		memCmd.set("highAddr", highNewAddr);
+		memCmd.set("highCtrl", highMemCtrlPost === true);		
+		memCmd.set("valid", inputCtrlPost === false);
+		
+		io.output("memCmd", memCmd, memCmd_t);
+		
+		
+		
+		
+		//---connect streams
+		inputCtrlPostBuffed <== stream.offset(inputCtrlPost, -offset, -432, -320);//125MHz, -416,-352,////-432,-320
+		highMemCtrlPostBuffed <== stream.offset(highMemCtrlPost, -offset, -432, -320);
+		
+		idBuffed <== stream.offset(id, -offset, -432, -320);
+		symBuffed <== stream.offset(sym, -offset, -432, -320);
+		lenBuffed <== stream.offset(len, -offset, -432, -320);
+		isPadBuffed <== stream.offset(isPad,  -offset, -432, -320);
+		phaseBuffed <== stream.offset(phaseNew, -offset, -432, -320);
+		
+		idxBuffed <== stream.offset(idxNew_phased, -offset, -432, -320);
+		
+		low <== stream.offset(lowNew_phased, -offset, -432, -320);//low will be 0 when data is not ready
+		high <== stream.offset(highNew_phased, -offset, -432, -320);//low will be 0 when data is not ready
+		
+		lowBwBuffed <== stream.offset(lowBwNew, -offset, -432, -320);//phase 2
+		highBwBuffed <== stream.offset(highBwNew, -offset, -432, -320);//phase 2
+		
+		
+		
+		//---set outputs
+		DFEVar isalignedBw = lowBwNew < highBwNew ? constant.var(dfeUInt(32), 1) : constant.var(dfeUInt(32), 0);
+		DFEVar isalignedFw = lowNew < highNew ? 	constant.var(dfeUInt(32), 1) : constant.var(dfeUInt(32), 0);
+		
+		DFEStruct out = out_t.newInstance(this);
+		out.set("id", id);
+		out.set("lowBw", lowBwNew);
+		out.set("highBw", highBwNew);
+		out.set("isalignedBw", isalignedBw);//phase 2
+		
+		out.set("lowFw", lowNew);
+		out.set("highFw", highNew);	
+		out.set("isalignedFw", isalignedFw);//phase 2
+		
+		out.set("pad", constant.var(dfeUInt(32), 0));
+		
+		io.output("alignOut", out, out_t, inputCtrlPost === true);
+		
+		DFEVar flushTrig = isPad === 2? constant.var(true) : constant.var(false);
+		io.output("flushTrig", flushTrig, dfeBool());
+		
+		flush.allowOutputBeforeFlush("memCmd");
+		flush.allowOutputBeforeFlush("flushTrig");
+		
+		flush.whenInputFinished("readIn");
+		
+		debug.simPrintf(id === 6, "><id2, **phase**: %d ", phase);
+		debug.simPrintf(id === 6, ".....symVal: %d ", symVal);
+		debug.simPrintf(id === 6, ".....low: %d ", low);
+		debug.simPrintf(id === 6, ".....high: %d ", high);
+		
+		debug.simPrintf(id === 6, ".....lowccount: %d ", lowCCount);
+		debug.simPrintf(id === 6, ".....highccount: %d ", highCCount);
+		
+		debug.simPrintf(id === 6, ".....lowICount: %d ", lowICount);
+		debug.simPrintf(id === 6, ".....highICount: %d \n", highICount);
+		
+		debug.simPrintf(id === 6, ".....low_idx: %d ", low_idx);
+		debug.simPrintf(id === 6, ".....high_idx: %d \n", high_idx);
+	
+		debug.simPrintf(id === 6, ".....lowNew: %d ", lowNew);
+		debug.simPrintf(id === 6, ".....highNew: %d \n\n", highNew);
+		
+		/*debug.simPrintf(id === 3, "\t \t \t --id3, **phase**: %d ", phase);
+		debug.simPrintf(id === 3, ".....symVal: %d ", symVal);
+		debug.simPrintf(id === 3, ".....low: %d ", low);
+		debug.simPrintf(id === 3, ".....high: %d ", high);
+	
+		debug.simPrintf(id === 3, ".....lowNew: %d ", lowNew);
+		debug.simPrintf(id === 3, ".....highNew: %d\n ", highNew);*/
+		
+		//debug.simPrintf(id === 6, ".....endCharBucketi: %d\n ", endCharBucketi);
+		
+		
+	}
+	
+	
+    // get counter, count table
+    private DFEVar getCount_Ctable(DFEVar sym, DFEVar bucket) {
+		DFEVectorType<DFEVar> ctable_cnt_t = new DFEVectorType<DFEVar>(dfeUInt(32), 4);
+		DFEVector<DFEVar> ctable_cnt = ctable_cnt_t.unpack(bucket.slice(0, BUCKET_CTABLE_BIT));
+
+		//ctable_cnt.simWatch("ctable_cnt");
+		return control.mux(sym, ctable_cnt.getElementsAsList());
+    }
+    
+    private DFEVar getCount_Itable(DFEVar sym, DFEVar x, DFEVar idx) {//DFEVar id, 
+    	//counting the number of a particular character
+    	DFEVectorType<DFEVar> count_t = new DFEVectorType<DFEVar>(dfeUInt(1), BUCKET_BWT_LEN);
+    	DFEVector<DFEVar> count = count_t.newInstance(this);
+    	
+    	DFEVectorType<DFEVar> bwt_t = new DFEVectorType<DFEVar>(dfeUInt(2), BUCKET_BWT_LEN);
+    	DFEVector<DFEVar> bwt = bwt_t.unpack(x.slice(BUCKET_CTABLE_BIT, BUCKET_BWT_LEN * BP_BITWIDTH));//128,384
+
+    	/*for (int i = 0; i < BUCKET_BWT_LEN; i++) {
+    		debug.simPrintf(id === 6, "%d ", bwt[i]);
+    	}
+		debug.simPrintf(id === 6, "...END.......\n ");	*/
+
+    	for (int i = 0; i < BUCKET_BWT_LEN; i++) {
+    	    count[i] <== (i < idx) & (sym.cast(dfeUInt(2)) === bwt[i]) ? 
+    		constant.var(dfeUInt(1), 1) : constant.var(dfeUInt(1), 0);
+    	}	
+    	
+    	DFEVar[] res = new DFEVar[BUCKET_BWT_LEN/64];
+    	for (int i = 0; i < BUCKET_BWT_LEN/64; i++) {
+    	    res[i] = popCount(count.pack().slice(i*64, 64).cast(dfeUInt(64)));
+    	}
+    	
+    	DFEVar cntNum = constant.var(dfeUInt(64), 0);
+    	for (int i = 0; i < BUCKET_BWT_LEN/64; i++){
+    		cntNum = cntNum + res[i];
+    	}
+
+    	return cntNum;
+    	//return res[0] + res[1] +  res[2]+ res[3];
+    }
+
+    // pop count
+    private DFEVar popCount(DFEVar x) {
+    	
+    	Bits m1Bits = new Bits(64, "5555555555555555");
+    	Bits m2Bits = new Bits(64, "3333333333333333");
+    	Bits m4Bits = new Bits(64, "0f0f0f0f0f0f0f0f");
+
+    	DFEVar m1 = constant.var(dfeUInt(64), m1Bits);
+    	DFEVar m2 = constant.var(dfeUInt(64), m2Bits);
+    	DFEVar m4 = constant.var(dfeUInt(64), m4Bits);
+
+    	x -= (x >> 1) & m1;
+    	x = (x & m2) + ((x >> 2) & m2);
+    	x = (x + (x >> 4)) & m4;
+    	x += x >>  8;
+    	x += x >> 16;
+    	x += x >> 32;
+    	
+    	return x & 0x7f;
+	}
+
+}
