@@ -1,0 +1,841 @@
+package tm1w;
+
+import static com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEStructType.sft;
+
+import com.maxeler.maxcompiler.v2.kernelcompiler.Kernel;
+import com.maxeler.maxcompiler.v2.kernelcompiler.KernelParameters;
+import com.maxeler.maxcompiler.v2.kernelcompiler.RoundingMode;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.base.DFEVar;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEStruct;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEStructType;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEVector;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEVectorType;
+import com.maxeler.maxcompiler.v2.utils.Bits;
+
+public class TMKernel extends Kernel {
+	
+	private static final int BUCKET_SIZE_BIT = 1;//**CHANGE THIS VAR FOR DIFF BRUST SIZE
+	private static final int MEM_BRUST_CNT = 1;//**CHANGE THIS VAR FOR DIFF BRUST SIZE
+	
+	private static final int BUCKET_CTABLE_BIT = 128;
+	private static final int BUCKET_ITABLE_BIT = BUCKET_SIZE_BIT - BUCKET_CTABLE_BIT;
+	
+	private static final int BUCKET_BWT_LEN_PWR = 
+			(int) (Math.log((double)(BUCKET_ITABLE_BIT/2)) / Math.log(2.0));
+	
+	private static final int MEM_BRUST_CNT_PWR = 
+			(int) (Math.log((double)(MEM_BRUST_CNT)) / Math.log(2.0));
+	
+	private static final int BUCKET_BWT_LEN = 1 << BUCKET_BWT_LEN_PWR;
+	
+	private static final int BP_BITWIDTH = 2;
+	
+	private static final int MAX_READ_LENGTH = 170;
+	private static final int MAX_READ_LENGTH_BIT = 8;
+	
+	private static final int N_HITS = 32;// Minimum 4, to make qs, misSym to be multiple of 8
+	private static final int N_HITS_BIT = 6;
+	
+	private static final int HIT_PAD = 128 - 8 - 32 -32;
+	
+	// alignment hit score
+	DFEVectorType<DFEVar> misPos_sorted_t = new DFEVectorType<DFEVar>(dfeUInt(8), N_HITS);
+	
+	DFEVectorType<DFEVar> low_sorted_t = new DFEVectorType<DFEVar>(dfeUInt(32), N_HITS);
+	DFEVectorType<DFEVar> high_sorted_t = new DFEVectorType<DFEVar>(dfeUInt(32), N_HITS);
+	
+	// store the quality score and missing sym together, to make 8 bits
+	DFEVectorType<DFEVar> qs_misSym_sorted_t = new DFEVectorType<DFEVar>(dfeUInt(2+6), N_HITS);
+	DFEVectorType<DFEVar> is_aligned_bck_t = new DFEVectorType<DFEVar>(dfeUInt(1), N_HITS);
+	// The pattern is:
+	// Sorted list: missed position, low, high, Quality Score, Missing Symbol
+	// Single Var: ID, Number of hits, padding
+	DFEStructType hitScore_t = new DFEStructType(
+				sft("misPos1Sorted", misPos_sorted_t),
+				sft("misPos2Sorted", misPos_sorted_t),
+				
+				sft("lowSorted", low_sorted_t),
+				
+				sft("highSorted", high_sorted_t),
+				
+				sft("qsMisSym1Sorted", qs_misSym_sorted_t),
+				sft("qsMisSym2Sorted", qs_misSym_sorted_t),
+				sft("isAlignedBck", is_aligned_bck_t),
+				
+				
+				sft("id", dfeUInt(32)),
+				sft("nHits", dfeUInt(8)),
+				sft("pad", dfeUInt(HIT_PAD)));
+
+	public TMKernel(final KernelParameters parameters) {
+		super(parameters);
+
+		optimization.pushRoundingMode(RoundingMode.TRUNCATE);
+		
+		DFEVectorType<DFEVar> sym_qs_t = new DFEVectorType<DFEVar>(dfeUInt(8), MAX_READ_LENGTH);
+		
+		// ** Inputs
+		// read input
+		DFEStructType in_t = new DFEStructType(
+						       sft("id", dfeUInt(32)),
+						       sft("symQS", sym_qs_t),
+						       sft("len", dfeUInt(MAX_READ_LENGTH_BIT)),
+						       sft("isPad", dfeUInt(8)));//8 bits because transferring 1 bit bool is not optimized
+		
+		// memory command
+		DFEStructType memCmd_t = new DFEStructType(
+							   sft("lowAddr", dfeUInt(32)),
+							   sft("highAddr", dfeUInt(32)),
+							   sft("highCtrl", dfeBool()),
+							   sft("valid", dfeBool()));
+		
+		// alignment hit
+		DFEStructType hit_t = new DFEStructType(
+							sft("id", dfeUInt(32)),
+							sft("low", dfeUInt(32)),
+							sft("high", dfeUInt(32)),
+							sft("misPos", dfeUInt(8)),
+							sft("misSym", dfeUInt(8)),
+							sft("pad", dfeUInt(16)));
+		
+		// kernel control counters
+		DFEVar offset = io.scalarInput("offset", dfeInt(32));
+		DFEVar tickCount = control.count.simpleCounter(32, offset.cast(dfeUInt(32)));
+		DFEVar tickInit = control.count.pulse(1, tickCount === offset.cast(dfeUInt(32)) - 1);
+				
+		// input stream control
+		DFEVar inputCtrlPostBuffed = dfeBool().newInstance(this);
+		DFEVar inputCtrl = tickInit === 1 ? constant.var(true) : inputCtrlPostBuffed;
+		
+		DFEVar highMemCtrlPostBuffed = dfeBool().newInstance(this);
+		DFEVar highMemCtrl = inputCtrl === true ? constant.var(false): highMemCtrlPostBuffed;
+		
+		// kernel input
+		// ---pci-e
+		DFEStruct readIn = io.input("readIn", in_t, inputCtrl === true);
+		
+		DFEVar highInit = io.scalarInput("highInit", dfeUInt(32));
+		DFEVar highInitRev = io.scalarInput("highInitRev", dfeUInt(32)); //for phase 2, subphase0
+		
+		DFEVar endCharBucket = io.scalarInput("endCharBucket", dfeUInt(32));	
+		DFEVar endCharBucketi = io.scalarInput("endCharBucketi", dfeUInt(32));
+		DFEVar endCharBucketRev = io.scalarInput("endCharBucketRev", dfeUInt(32));	
+		DFEVar endCharBucketiRev = io.scalarInput("endCharBucketiRev", dfeUInt(32));	
+		
+		DFEVar isReverseCmpt = io.scalarInput("isReverseCmpt", dfeUInt(8));
+		
+		// since there is reversed search, so need to have offset
+		DFEVar readOffset = io.scalarInput("readOffset", dfeUInt(32));
+		
+		
+		
+		
+		// set up streams
+		// ---pci-e		
+		DFEVar idIn = readIn.get("id");
+		DFEVar idBuffed = dfeUInt(32).newInstance(this);
+		DFEVar id = inputCtrl === true ? idIn : idBuffed;
+		
+		DFEVector<DFEVar> symQSIn = readIn.get("symQS");
+		DFEVector<DFEVar> symQSBuffed = sym_qs_t.newInstance(this);
+		DFEVector<DFEVar> symQS = inputCtrl === true ? symQSIn : symQSBuffed;
+		
+		DFEVar lenIn = readIn.get("len");
+		DFEVar lenBuffed = dfeUInt(MAX_READ_LENGTH_BIT).newInstance(this);
+		DFEVar len = inputCtrl === true ? lenIn : lenBuffed;
+		
+		DFEVar isPadIn = readIn.get("isPad");
+		DFEVar isPadBuffed = dfeUInt(8).newInstance(this);
+		DFEVar isPad = inputCtrl === true ? isPadIn : isPadBuffed;
+		
+		
+		
+		
+		// -- Local Variables/ Regs
+		DFEVar lowBuffed = dfeUInt(32).newInstance(this);// We didn't initialize 0 to these variables in FMKernel, but it is ok
+		DFEVar low = inputCtrl === true ? constant.var(dfeUInt(32), 0) : lowBuffed;
+		
+		DFEVar highBuffed = dfeUInt(32).newInstance(this);
+		DFEVar high = inputCtrl === true ? constant.var(dfeUInt(32), 0) : highBuffed;
+		
+		DFEVar phaseBuffed = dfeUInt(2).newInstance(this);
+		DFEVar phase = inputCtrl === true ? constant.var(dfeUInt(2), 0) : phaseBuffed;
+		
+		DFEVar phase2SubPhaseBuffed = dfeUInt(1).newInstance(this);
+		DFEVar phase2SubPhase = inputCtrl === true ? constant.var(dfeUInt(1), 0): phase2SubPhaseBuffed;
+
+
+
+
+		DFEVar lenExtd = len.cast(dfeUInt(MAX_READ_LENGTH_BIT + 1));
+		DFEVar processLen = phase === 2 ? (lenExtd * 2) : lenExtd;
+		
+		
+		DFEVar lenDiv3 = (lenExtd + 2) / 3;	
+		
+		// ---The index within a read
+		//DFEVar idxInit = phase === 2 ? lenDiv3 : constant.var(dfeUInt(MAX_READ_LENGTH_BIT + 1), 0);
+		DFEVar idxInit = constant.var(dfeUInt(MAX_READ_LENGTH_BIT + 1), 0);
+		DFEVar idxBuffed = dfeUInt(MAX_READ_LENGTH_BIT + 1).newInstance(this);
+		DFEVar idx = inputCtrl === true ? idxInit : idxBuffed;
+		
+		
+
+		
+		// ** Backtracking Variables
+		// -- Pos1
+		//DFEVar misPos1Init =  phase === 0 ? lenDiv3: 
+		//						phase === 1 ? lenDiv3 - 1 : 
+		//						lenExtd - lenDiv3 + 1;
+		DFEVar misPos1Init = lenDiv3;
+		DFEVar misPos1Buffed = dfeUInt(MAX_READ_LENGTH_BIT+1).newInstance(this);
+		DFEVar misPos1 = inputCtrl === true ? misPos1Init : misPos1Buffed;	
+		
+		DFEVar misSymVal1Buffed = dfeUInt(2).newInstance(this);
+		DFEVar misSymVal1 = inputCtrl === true ? constant.var(dfeUInt(2), 0) : misSymVal1Buffed;
+		
+		DFEVar misCount1Buffed = dfeUInt(2).newInstance(this);
+		DFEVar misCount1 = inputCtrl === true ? constant.var(dfeUInt(2), 0) : misCount1Buffed;
+		
+		DFEVar lowMis1Buffed = dfeUInt(32).newInstance(this);
+		DFEVar lowMis1 = inputCtrl === true ? constant.var(dfeUInt(32), 0) : lowMis1Buffed;
+
+		DFEVar highMis1Buffed = dfeUInt(32).newInstance(this);
+		DFEVar highMis1 = inputCtrl === true ? constant.var(dfeUInt(32), 0) : highMis1Buffed;	
+		
+		//DFEVar misSymSubphase0Buffed = dfeUInt(2).newInstance(this);
+		//DFEVar misSymSubphase0 = inputCtrl === true ? constant.var(dfeUInt(2), 0): misSymSubphase0Buffed;
+		
+		
+		
+		// -- Pos2
+		//DFEVar misPos2Init =  phase === 0 ? lenDiv3 + 1:
+		//						phase === 1 ? lenExtd - lenDiv3 :
+		//						len + len - lenDiv3;
+		DFEVar misPos2Init = lenDiv3 + 1;
+		DFEVar misPos2Buffed = dfeUInt(MAX_READ_LENGTH_BIT+1).newInstance(this);
+		DFEVar misPos2 = inputCtrl === true ? misPos2Init : misPos2Buffed;
+		
+		DFEVar misSymVal2Buffed = dfeUInt(2).newInstance(this);
+		DFEVar misSymVal2 = inputCtrl === true ? constant.var(dfeUInt(2), 0) : misSymVal2Buffed;
+		
+		DFEVar misCount2Buffed = dfeUInt(2).newInstance(this);
+		DFEVar misCount2 = inputCtrl === true ? constant.var(dfeUInt(2), 0) : misCount2Buffed;
+		
+		DFEVar lowMis2Buffed = dfeUInt(32).newInstance(this);
+		DFEVar lowMis2 = inputCtrl === true ? constant.var(dfeUInt(32), 0) : lowMis2Buffed;
+
+		DFEVar highMis2Buffed = dfeUInt(32).newInstance(this);
+		DFEVar highMis2 = inputCtrl === true ? constant.var(dfeUInt(32), 0) : highMis2Buffed;
+		
+		
+		
+		
+		
+		// get read symbols
+		DFEVar symIdx = isReverseCmpt === 1? 
+					   (phase === 0 | (phase === 2 & phase2SubPhase === 0) ? lenExtd-idx-1:
+						phase === 2 & phase2SubPhase === 1? idx - lenExtd : idx): //phase === 1 ? idx:
+							
+					   (phase === 0 | (phase === 2 & phase2SubPhase === 0) ? idx:
+						phase === 2 & phase2SubPhase === 1? lenExtd - (idx - lenExtd) - 1 : lenExtd-idx-1); //phase === 1 ? len-idx-1:
+		//DFEVar symIdx = flipStg === 0 ? idx : len-idx-1;
+		
+		// get read symbols	
+		DFEVar symQSVal = control.mux(symIdx.cast(dfeUInt(8)), symQS.getElementsAsList());
+		DFEVar symValPrimitive = symQSVal.slice(0, 2).cast(dfeUInt(2));
+		DFEVar qsVal = symQSVal.slice(2, 6).cast(dfeUInt(6));
+		
+		//A-T, C->G
+		DFEVar reverseCmpt = symValPrimitive === constant.var(dfeUInt(2), 0) ? constant.var(dfeUInt(2), 3):
+								symValPrimitive === constant.var(dfeUInt(2), 1) ? constant.var(dfeUInt(2), 2):
+								symValPrimitive === constant.var(dfeUInt(2), 2) ? constant.var(dfeUInt(2), 1):
+												constant.var(dfeUInt(2), 0);		
+		
+								
+		DFEVar symVal  =  isReverseCmpt === 0 ? symValPrimitive:reverseCmpt;	
+		
+		// initialise SA interval
+		DFEVar lowInit = constant.var(dfeUInt(32), 0);
+		
+		// insert mismatch symbols, acutally phase check may not be necessary
+		DFEVar isMis1 = (idx === misPos1 & 
+						(phase !== 2 | phase === 2 & phase2SubPhase === 0) &
+						inputCtrl === false) ? constant.var(true) : constant.var(false);
+
+		// You want to put a mismatch in there, so no point putting the same sym
+		DFEVar misSymVal1Chked = ((isMis1 === true) & (misSymVal1 === symVal)) ? misSymVal1 + 1 : misSymVal1;
+		
+		// The missing char for the next round
+		DFEVar misSymVal1New = isMis1 ? misSymVal1Chked +1 : misSymVal1Chked;
+		DFEVar misCount1New = isMis1 ? misCount1 + 1 : misCount1;
+		DFEVar lowMis1New = isMis1 ? low : lowMis1;
+		DFEVar highMis1New = isMis1 ? high : highMis1;
+
+		// special char to replace for phase 2
+		//DFEVar misSymSubphase0New = isMis1 ? misSymVal1Chked: misSymSubphase0;
+		
+
+
+		
+		DFEVar isMis2 = (idx === misPos2) &
+						(phase !== 2 | phase === 2 & phase2SubPhase === 1) ? 
+						constant.var(true) : constant.var(false);
+		
+		DFEVar misSymVal2Chked = ((isMis2 === true) & (misSymVal2 === symVal)) ? misSymVal2 + 1 : misSymVal2;
+		
+		DFEVar misSymVal2New = isMis2 ? misSymVal2Chked +1 : misSymVal2Chked;
+		DFEVar misCount2New = isMis2 ? misCount2 + 1 : misCount2;
+		DFEVar lowMis2New = isMis2 ? low : lowMis2;
+		DFEVar highMis2New = isMis2 ? high : highMis2;
+		
+		
+		DFEVar symNew = isMis1 ? misSymVal1Chked : 
+						isMis2 ? misSymVal2Chked: 
+						phase === 2 & phase2SubPhase === 1 & idx === lenExtd + lenExtd - misPos1 - 1?
+						(misSymVal1 - 1 === symVal ? misSymVal1 - 2: misSymVal1-1):
+						symVal;
+		
+		// update SA interval
+		//---DDR
+		DFEVar endCharBucketSel     = (phase === 0 | 
+										(phase === 2 & phase2SubPhase === 0)) ? endCharBucket: endCharBucketRev;
+		DFEVar endCharBucketiSel    = (phase === 0 | 
+										(phase === 2 & phase2SubPhase === 0)) ? endCharBucketi: endCharBucketiRev;
+		
+		DFEVar lowBucket = io.input("lowIndex", dfeRawBits(BUCKET_SIZE_BIT), inputCtrl === false);
+		DFEVar highBucket = io.input("highIndex", dfeRawBits(BUCKET_SIZE_BIT), highMemCtrl === true);
+		
+		// handle low count
+		// update SA interval, the data should be available from DDR
+		DFEVar lowCCount = getCount_Ctable(symNew, lowBucket);
+		DFEVar low_idx = low & (BUCKET_BWT_LEN-1);// mod to calculate the offset within the bucket
+		
+		DFEVar lowICount = getCount_Itable(symNew, lowBucket, low_idx);
+		
+		DFEVar lowUp_unchekEnd = lowCCount + lowICount.cast(dfeUInt(32));
+		
+		// handle end char, it is stored at a sym_val === 0
+		DFEVar lowUp = (endCharBucketSel === (low >> BUCKET_BWT_LEN_PWR) & endCharBucketiSel < low_idx
+						& symNew === 0)?  lowUp_unchekEnd - 1: lowUp_unchekEnd;
+		
+		
+		
+		DFEVar highCCount = highMemCtrl === true ? getCount_Ctable(symNew, highBucket) : lowCCount;
+		//TODO: not generalized for this line 
+		DFEVar high_idx = high & (BUCKET_BWT_LEN-1);
+		
+		DFEVar highICount = highMemCtrl === true ? 
+				getCount_Itable(symNew, highBucket, high_idx) : getCount_Itable(symNew, lowBucket, high_idx);
+				
+		DFEVar highUp_unchekEnd = highCCount + highICount.cast(dfeUInt(32));
+		
+		// handle end char, it is stored at a sym_val === 0
+		DFEVar highUp = (endCharBucketSel === (high >> BUCKET_BWT_LEN_PWR) & endCharBucketiSel < high_idx 
+					& symNew === 0)? highUp_unchekEnd - 1: highUp_unchekEnd;
+		
+		
+		// update alignment state
+		// --- check if it is the first char 
+		// PrePost means it is used before and after the pulse signal, 0 (before) and the updated value for lowUp (after)
+		DFEVar lowNew = inputCtrl === true ? lowInit: lowUp;
+		DFEVar highNew = inputCtrl === true ? highInit: highUp;
+		
+		DFEVar isAligning =  lowNew < highNew ? constant.var(true) : constant.var(false);
+		
+		DFEVar idxNew = inputCtrl === true ? idx : idx + 1;
+		DFEVar isHit = (isAligning === true) & (idxNew === processLen) & (isPad === 0) ?  constant.var(true) : constant.var(false);
+		
+		
+		// backtracking logic
+		DFEVar backtrack = isAligning === false | isHit === true ? constant.var(true) : constant.var(false);		
+		
+		DFEVar lowNew_b = (backtrack === true & idx >= misPos2) ? lowMis2New: 
+							(backtrack === true & idx < misPos2) ? lowMis1New: 
+							(phase === 2 & idx === lenExtd - 1)? 0 :
+							lowNew;
+		DFEVar highNew_b = (backtrack === true & idx >= misPos2) ? highMis2New: 
+								(backtrack === true & idx < misPos2) ? highMis1New: 
+								(phase === 2 & idx ===  lenExtd - 1)? highInitRev:
+								highNew;
+		DFEVar idxNew_b = (backtrack === true & idx >= misPos2) ? misPos2: 
+							(backtrack === true & idx < misPos2) ? misPos1: idxNew;
+		
+		DFEVar phase2SubPhase_b = (backtrack === true & idx < misPos2) ? 0 :
+									(phase === 2 & idx >= lenExtd - 1) ? 1 :
+									(phase === 2 & idx < lenExtd - 1) ? 0 : phase2SubPhase;
+									
+
+
+		//misCount should be starting from 1 till 3, only need to check for 3 times because you don't consider existing sym
+		DFEVar misPos1_b = (backtrack === true) & (idx < misPos2) & (misCount1New === 3) ? misPos1 + 1 : misPos1;
+		DFEVar misPos2_b = (backtrack === true) & (idx < misPos2) ? 
+												( phase === 0 ? misPos1_b + 1 :
+												  phase === 1 ? ( misPos1_b >= lenExtd - lenDiv3 ? misPos1_b + 1 : lenExtd - lenDiv3) :
+												  lenExtd + lenExtd - lenDiv3 ) :
+							(backtrack === true) & (idx >= misPos2) & (misCount2New === 3) ?  misPos2 + 1:  misPos2;
+				
+		DFEVar misSymVal1New_b = (backtrack === true) & (idx < misPos2) & (misCount1New === 3) ? constant.var(dfeUInt(2), 0) : misSymVal1New;
+		DFEVar misSymVal2New_b = (backtrack === true) & (idx < misPos2) & (misCount1New === 3) ? constant.var(dfeUInt(2), 0) : 
+									(backtrack === true) & (idx >= misPos2) & (misCount2New === 3) ? constant.var(dfeUInt(2), 0) : misSymVal2New;
+									
+		DFEVar misCount1_b = (backtrack === true) & (idx < misPos2) & (misCount1New === 3) ?  constant.var(dfeUInt(2), 0) : misCount1New;
+		DFEVar misCount2_b = (backtrack === true) & (idx < misPos2) & (misCount1New === 3) ?  constant.var(dfeUInt(2), 0) : 
+								(backtrack === true) & (idx >= misPos2) & (misCount2New === 3) ? constant.var(dfeUInt(2), 0) : misCount2New;
+
+
+		//handle the last position, and determine if the search has to be done from another side
+		DFEVar partialSearchEnd    = (isAligning === false & idx < misPos1 & isPad === 0) | 
+										(idxNew_b === processLen & isPad === 0) |
+										(phase === 2 & misPos1_b === lenExtd & isPad === 0)? 
+									constant.var(true) : constant.var(false);
+		
+		
+		DFEVar phaseNew         = partialSearchEnd ? phase + 1: phase; 
+		//DFEVar processLen_phased = partialSearchEnd ? (phaseNew === 2 ? lenExtd * 2: lenExtd): processLen;
+
+		DFEVar lowNew_phased    = partialSearchEnd ? lowInit: lowNew_b;
+		DFEVar highNew_phased   = partialSearchEnd ? highInit: highNew_b;
+		
+		DFEVar idxNew_phased    = partialSearchEnd ? (phaseNew === 2 ? lenDiv3: 0): idxNew_b;
+
+		DFEVar misPos1_phased   = partialSearchEnd ? (phaseNew === 1 ? lenDiv3 - 1 : 
+													  phaseNew === 2 ? lenExtd - lenDiv3 + 1: 
+													  lenDiv3) : misPos1_b;
+		DFEVar misPos2_phased   = partialSearchEnd ? (phaseNew === 1 ? lenExtd - lenDiv3 : 
+													  phaseNew === 2 ? lenExtd + lenExtd - lenDiv3: 
+													  lenDiv3 + 1) : misPos2_b;
+		                            
+		/*DFEVar flipStgNew 		= flipSearchEnd ? flipStg + 1 : flipStg;
+		DFEVar lowNew_flip 		= flipSearchEnd ? lowInit: lowNew_b;
+		DFEVar highNew_flip 	= flipSearchEnd ? highInit: highNew_b;
+		DFEVar idxNew_flip		= flipSearchEnd ? 0: idxNew_b;
+		DFEVar misPos1_flip     = flipSearchEnd ? constant.var(dfeUInt(MAX_READ_LENGTH_BIT+1), 0): misPos1_b;
+		DFEVar misPos2_flip		= flipSearchEnd ? constant.var(dfeUInt(MAX_READ_LENGTH_BIT+1), 1): misPos2_b;*/
+								
+		//DFEVar inputCtrlPost = (isAligning === false & idx < misPos1) | (idxNew_b === len & isPad === 0) ? 
+								//constant.var(true) : constant.var(false);
+		DFEVar inputCtrlPost    = phaseNew === 3 ? constant.var(true) : constant.var(false);
+		////DFEVar inputCtrlPost    = flipStgNew === 2 ? constant.var(true) : constant.var(false);							
+		
+		// generate new memory command
+		DFEVar lowNewAddr   = phaseNew === 1 | (phaseNew === 2 & phase2SubPhase_b === 1) ? 
+								readOffset + ((lowNew_phased >> BUCKET_BWT_LEN_PWR) << (MEM_BRUST_CNT_PWR)): 
+								(lowNew_phased >> BUCKET_BWT_LEN_PWR) << (MEM_BRUST_CNT_PWR);
+		DFEVar highNewAddr  = phaseNew === 1 | (phaseNew === 2 & phase2SubPhase_b === 1) ?  
+								readOffset + ((highNew_phased >> BUCKET_BWT_LEN_PWR) << (MEM_BRUST_CNT_PWR)):  
+								(highNew_phased >> BUCKET_BWT_LEN_PWR) << (MEM_BRUST_CNT_PWR);
+		
+		////DFEVar lowNewAddr = (lowNew_flip >> BUCKET_BWT_LEN_PWR) << (MEM_BRUST_CNT_PWR) ;//phase 2
+	 	////DFEVar highNewAddr = (highNew_flip >> BUCKET_BWT_LEN_PWR)  << (MEM_BRUST_CNT_PWR) ;//phase 2
+		
+		DFEVar highMemCtrlPost = (lowNewAddr !== highNewAddr) & inputCtrlPost === false ? constant.var(true) : constant.var(false);
+		
+		DFEStruct memCmd = memCmd_t.newInstance(this);
+		
+		memCmd.set("lowAddr", lowNewAddr);
+		memCmd.set("highAddr", highNewAddr);
+		memCmd.set("highCtrl", highMemCtrlPost);
+		memCmd.set("valid", inputCtrlPost === false );
+		
+		io.output("memCmd", memCmd, memCmd_t);
+		
+		
+		// ---Intermediate result with quality score
+		DFEVar qsMis1Buffed = dfeUInt(6).newInstance(this);
+		DFEVar qsMis1 = inputCtrl === true ? constant.var(dfeUInt(6), 0) : qsMis1Buffed;
+		
+		DFEVar qsMis2Buffed = dfeUInt(6).newInstance(this);
+		DFEVar qsMis2 = inputCtrl === true ? constant.var(dfeUInt(6), 0) : qsMis2Buffed;
+		
+		DFEVar hitMisSymVal1Buffed = dfeUInt(2).newInstance(this);
+		DFEVar hitMisSymVal1 = inputCtrl === true ? constant.var(dfeUInt(2), 0) : hitMisSymVal1Buffed;
+		
+		DFEVar hitMisSymVal2Buffed = dfeUInt(2).newInstance(this);
+		DFEVar hitMisSymVal2 = inputCtrl === true ? constant.var(dfeUInt(2), 0) : hitMisSymVal2Buffed;
+		
+		DFEVar qsMis1New = (idx === misPos1)? qsVal: qsMis1;
+		DFEVar qsMis2New = (idx === misPos2)? qsVal: qsMis2;
+		DFEVar hitMisSymVal1New = (idx === misPos1)? misSymVal1Chked: hitMisSymVal1;
+		DFEVar hitMisSymVal2New = (idx === misPos2)? misSymVal2Chked: hitMisSymVal2;
+		
+		// hit count
+		DFEVar hitCntBuffed = dfeUInt(N_HITS_BIT).newInstance(this);
+		DFEVar hitCnt = inputCtrl === true ? constant.var(dfeUInt(N_HITS_BIT), 0): hitCntBuffed;
+		
+		//TODO: & misPos2 !== processLen <- no need this, but check later
+		DFEVar isMisHit = isHit === true & idxNew_b !== processLen & misPos1 !== lenExtd & misPos2 !== processLen & isPad === 0;
+		DFEVar hitCntNew = isMisHit ? hitCnt + 1: hitCnt;
+		
+		
+		DFEVector<DFEVar> lowSortedBuffed = low_sorted_t.newInstance(this);
+		DFEVector<DFEVar> lowSorted = inputCtrl === true ? constant.vect(N_HITS, dfeUInt(32), 0): lowSortedBuffed;
+		
+		DFEVector<DFEVar> highSortedBuffed = high_sorted_t.newInstance(this);
+		DFEVector<DFEVar> highSorted = inputCtrl === true ? constant.vect(N_HITS, dfeUInt(32), 0): highSortedBuffed;
+		
+		DFEVector<DFEVar> misPos1SortedBuffed = misPos_sorted_t.newInstance(this);
+		DFEVector<DFEVar> misPos1Sorted = inputCtrl === true ? constant.vect(N_HITS, dfeUInt(8), 0): misPos1SortedBuffed;
+		
+		DFEVector<DFEVar> misPos2SortedBuffed = misPos_sorted_t.newInstance(this);
+		DFEVector<DFEVar> misPos2Sorted = inputCtrl === true ? constant.vect(N_HITS, dfeUInt(8), 0): misPos2SortedBuffed;
+		
+		DFEVector<DFEVar> qsMisSym1SortedBuffed = qs_misSym_sorted_t.newInstance(this);
+		DFEVector<DFEVar> qsMisSym1Sorted = inputCtrl === true ? constant.vect(N_HITS, dfeUInt(8), 0): qsMisSym1SortedBuffed;
+		
+		DFEVector<DFEVar> qsMisSym2SortedBuffed = qs_misSym_sorted_t.newInstance(this);
+		DFEVector<DFEVar> qsMisSym2Sorted = inputCtrl === true ? constant.vect(N_HITS, dfeUInt(8), 0): qsMisSym2SortedBuffed;
+	
+		DFEVector<DFEVar> isAlignedBckBuffed = is_aligned_bck_t.newInstance(this);
+		DFEVector<DFEVar> isAlignedBck = inputCtrl === true ? constant.vect(N_HITS, dfeUInt(1), 0): isAlignedBckBuffed;
+		
+		////DFEVector<DFEVar> isRevCmptBuffed = is_rev_cmpt_t.newInstance(this);
+		////DFEVector<DFEVar> isRevCmpt = inputCtrl === true ? constant.vect(N_HITS, dfeUInt(1), 0): isRevCmptBuffed;
+
+		// insert into shift register by calling the methods
+		DFEStruct hitScore = shfQS(	misPos1, misPos1Sorted,
+									misPos2, misPos2Sorted,
+									lowNew, lowSorted,
+									highNew, highSorted,
+									qsMis1New, hitMisSymVal1New, qsMisSym1Sorted, 
+									qsMis2New, hitMisSymVal2New, qsMisSym2Sorted,
+									isAlignedBck,
+									isMisHit, hitCntNew,
+									phase, processLen, id);
+		
+		DFEVector<DFEVar> misPos1SortedNew = hitScore.get("misPos1Sorted");
+		DFEVector<DFEVar> misPos2SortedNew = hitScore.get("misPos2Sorted");
+		DFEVector<DFEVar> lowSortedNew = hitScore.get("lowSorted");
+		DFEVector<DFEVar> highSortedNew = hitScore.get("highSorted");
+		DFEVector<DFEVar> qsMisSym1SortedNew = hitScore.get("qsMisSym1Sorted");
+		DFEVector<DFEVar> qsMisSym2SortedNew = hitScore.get("qsMisSym2Sorted");
+		DFEVector<DFEVar> isAlignedBckNew = hitScore.get("isAlignedBck");
+		//DFEVector<DFEVar> isRevCmptNew = hitScore.get("isRevCmpt");
+		
+		// if backtracking happens, reset
+		DFEVar qsMis1New_b = (backtrack === true) & (idx < misPos2) & (misCount1New === 3) ? constant.var(dfeUInt(6), 0) :qsMis1New;
+		DFEVar qsMis2New_b = ((backtrack === true) & (idx < misPos2)) | 
+								((backtrack === true) & (idx >= misPos2) & (misCount2New === 3)) ? constant.var(dfeUInt(6), 0) : qsMis2New;
+		
+		
+		idBuffed <== stream.offset(id, -offset, -432, -320);
+		symQSBuffed <== stream.offset(symQS, -offset, -432, -320);
+		lenBuffed <== stream.offset(len, -offset, -432, -320);
+		isPadBuffed <== stream.offset(isPad, -offset, -432, -320);
+		
+		//flipStgBuffed <== stream.offset(flipStgNew, -offset, -432, -320);
+		
+		lowBuffed <== stream.offset(lowNew_phased, -offset, -432, -320);
+		highBuffed <== stream.offset(highNew_phased, -offset, -432, -320);
+		
+		phaseBuffed <== stream.offset(phaseNew, -offset, -432, -320);
+		phase2SubPhaseBuffed <== stream.offset(phase2SubPhase_b, -offset, -432, -320);
+		//processLenBuffed <== stream.offset(processLen_phased, -offset, -432, -320);
+
+		idxBuffed <== stream.offset(idxNew_phased, -offset, -432, -320);
+		
+		////idxBuffed <== stream.offset(idxNew_phased, -offset, -432, -320);
+		////lowBuffed <== stream.offset(lowNew_phased, -offset, -432, -320);
+		////highBuffed <== stream.offset(highNew_phased, -offset, -432, -320);
+		
+		////misPos1Buffed <== stream.offset(misPos1_phased, -offset, -432, -320);
+		misPos1Buffed <== stream.offset(misPos1_phased, -offset, -432, -320);
+		misSymVal1Buffed <== stream.offset(misSymVal1New_b, -offset, -432, -320);
+		misCount1Buffed <== stream.offset(misCount1_b, -offset, -432, -320);
+		lowMis1Buffed <== stream.offset(lowMis1New, -offset, -432, -320);
+		highMis1Buffed <== stream.offset(highMis1New, -offset, -432, -320);
+		// might not be necessary, but keep is anyway
+		//misSymSubphase0Buffed <== stream.offset(misSymSubphase0New, -offset, -432, 320);
+		
+		////misPos2Buffed <== stream.offset(misPos2_phased, -offset, -432, -isRevCmpt320);
+		misPos2Buffed <== stream.offset(misPos2_phased, -offset, -432, -320);
+		misSymVal2Buffed <== stream.offset(misSymVal2New_b, -offset, -432, -320);
+		misCount2Buffed <== stream.offset(misCount2_b, -offset, -432, -320);
+		lowMis2Buffed <== stream.offset(lowMis2New, -offset, -432, -320);
+		highMis2Buffed <== stream.offset(highMis2New, -offset, -432, -320);
+		
+		inputCtrlPostBuffed <== stream.offset(inputCtrlPost, -offset, -432, -320);
+		highMemCtrlPostBuffed <== stream.offset(highMemCtrlPost, -offset, -432, -320);
+		
+		qsMis1Buffed <== stream.offset(qsMis1New_b, -offset, -432, -320);
+		qsMis2Buffed <== stream.offset(qsMis2New_b, -offset, -432, -320);
+		hitMisSymVal1Buffed <== stream.offset(hitMisSymVal1New, -offset, -432, -320);
+		hitMisSymVal2Buffed <== stream.offset(hitMisSymVal2New, -offset, -432, -320);
+		
+		// Buffer up the contents of the shift registers
+		hitCntBuffed <== stream.offset(hitCntNew, -offset, -432, -320);
+
+		lowSortedBuffed <== stream.offset(lowSortedNew, -offset, -432, -320);
+		highSortedBuffed <== stream.offset(highSortedNew, -offset, -432, -320);
+		
+		misPos1SortedBuffed <== stream.offset(misPos1SortedNew, -offset, -432, -320);
+		misPos2SortedBuffed <== stream.offset(misPos2SortedNew, -offset, -432, -320);
+		
+		qsMisSym1SortedBuffed <== stream.offset(qsMisSym1SortedNew, -offset, -432, -320);
+		qsMisSym2SortedBuffed <== stream.offset(qsMisSym2SortedNew, -offset, -432, -320);	
+		isAlignedBckBuffed <== stream.offset(isAlignedBckNew, -offset, -432, -320);
+		
+		//isRevCmptBuffed <== stream.offset(isRevCmptNew, -offset, -432, -320);
+		
+		io.output("hitOut", hitScore, hitScore_t, inputCtrlPost === true);
+/*DFEStruct hit = hit_t.newInstance(this);
+		
+		hit.set("id", id);
+		hit.set("low", lowNew);
+		hit.set("high", highNew);
+		hit.set("misPos", misPos1.cast(dfeUInt(8)) );
+		hit.set("misSym", misSymVal1New.cast(dfeUInt(8)));
+		hit.set("pad", constant.var(dfeUInt(16), 0));
+		io.output("hitOut", hit, hit_t, inputCtrlPost === true);*/
+		
+		
+		debug.simPrintf(id === 3, "idx %d\n", idx);
+		debug.simPrintf(id === 3, "misPos1 %d misPos2 %d\n", misPos1, misPos2);
+		debug.simPrintf(id === 3, "curLen %d phase %d\n", lenExtd, phase);
+		debug.simPrintf(id === 3, "Idx %d, Original sym %d Current sym %d\n", symIdx, symVal, symNew);
+		debug.simPrintf(id === 3, "low %d high %d\n", lowUp, highUp);
+		debug.simPrintf(id === 3, "\n***isHit???? %d\n", isHit);
+		debug.simPrintf(id === 3, "***isMisHit???? %d\n\n", isMisHit);
+		//debug.simPrintf(id === 3, "misPos1_b ... %d ", misPos1_b);
+		//debug.simPrintf(id === 3, "misPos2_b ... %d\n ", misPos2_b);
+		
+		//debug.simPrintf(id === 3, "misCount1New ... %d ", misCount1New);
+		//debug.simPrintf(id === 3, "misCount2New ... %d\n ", misCount2New);
+		
+		
+		/*debug.simPrintf(id === 3, "\n \n idx ... %d ", idx);
+		//debug.simPrintf(id === 3, "\n \n symQsVal ... %d ", symQsVal);
+		debug.simPrintf(id === 3, "\n misPos1 ... %d \n misPos2 ... %d ", misPos1, misPos2);
+		debug.simPrintf(id === 3, "\n Original sym ... %d Current sym ... %d ", symVal, symNew);
+		//debug.simPrintf(id === 3, "\n >>>>>> misQSVal ... %d qsMisNew_b ... %d qsMisBuffed ... %d ", qsMisNew, qsMisNew_b, qsMisBuffed);
+		//debug.simPrintf(id === 3, "\n >>>>>> hitCntNew ... %d ", hitCntNew);
+		
+		
+		debug.simPrintf(id === 3, "\n misCount1 ... %d ", misCount1);
+		debug.simPrintf(id === 3, "\n misCount2 ... %d ", misCount2);
+		debug.simPrintf(id === 3, "\n ..........Original sym ... Newly calculated low %d high %d", lowUp, highUp);
+		debug.simPrintf(id === 3, "\n ...backtracking???? %d", backtrack);
+		debug.simPrintf(id === 3, "\n ***isHit???? %d", isHit);
+		debug.simPrintf(id === 3, "\n #########Phase??? %d PhaseNew %d", phase, phaseNew);*/
+		
+		
+		DFEVar flushTrig = isPad === 2? constant.var(true) : constant.var(false);
+		io.output("flushTrig", flushTrig, dfeBool());
+		
+		flush.allowOutputBeforeFlush("memCmd");//Ensure this signal get output before the flush signal
+		flush.allowOutputBeforeFlush("flushTrig");//Ensure this signal get output before the flush signal
+		
+		flush.whenInputFinished("readIn");//this indicates when to flush
+		
+		debug.simPrintf(isPad === 2, "isPad === 2: %d ", flushTrig);
+
+	}
+	
+    // get counter, count table
+    private DFEVar getCount_Ctable(DFEVar sym, DFEVar bucket) {
+		DFEVectorType<DFEVar> ctable_cnt_t = new DFEVectorType<DFEVar>(dfeUInt(32), 4);
+		DFEVector<DFEVar> ctable_cnt = ctable_cnt_t.unpack(bucket.slice(0, BUCKET_CTABLE_BIT));
+
+		return control.mux(sym, ctable_cnt.getElementsAsList());
+    }
+    
+    private DFEVar getCount_Itable(DFEVar sym, DFEVar x, DFEVar idx) {
+    	//counting the number of a particular character
+    	DFEVectorType<DFEVar> count_t = new DFEVectorType<DFEVar>(dfeUInt(1), BUCKET_BWT_LEN);
+    	DFEVector<DFEVar> count = count_t.newInstance(this);
+    	
+    	DFEVectorType<DFEVar> bwt_t = new DFEVectorType<DFEVar>(dfeUInt(2), BUCKET_BWT_LEN);
+    	DFEVector<DFEVar> bwt = bwt_t.unpack(x.slice(BUCKET_CTABLE_BIT, BUCKET_BWT_LEN * BP_BITWIDTH));//128,384
+
+    	for (int i = 0; i < BUCKET_BWT_LEN; i++) {
+    	    count[i] <== (i < idx) & (sym.cast(dfeUInt(2)) === bwt[i]) ? 
+    		constant.var(dfeUInt(1), 1) : constant.var(dfeUInt(1), 0);
+    	}	
+    	
+    	DFEVar[] res = new DFEVar[BUCKET_BWT_LEN/64];
+    	for (int i = 0; i < BUCKET_BWT_LEN/64; i++) {
+    	    res[i] = popCount(count.pack().slice(i*64, 64).cast(dfeUInt(64)));
+    	}
+    	
+    	DFEVar cntNum = constant.var(dfeUInt(64), 0);
+    	for (int i = 0; i < BUCKET_BWT_LEN/64; i++){
+    		cntNum = cntNum + res[i];
+    	}
+
+    	return cntNum;
+    }
+    
+    // pop count
+    private DFEVar popCount(DFEVar x) {
+    	
+    	Bits m1Bits = new Bits(64, "5555555555555555");
+    	Bits m2Bits = new Bits(64, "3333333333333333");
+    	Bits m4Bits = new Bits(64, "0f0f0f0f0f0f0f0f");
+
+    	DFEVar m1 = constant.var(dfeUInt(64), m1Bits);
+    	DFEVar m2 = constant.var(dfeUInt(64), m2Bits);
+    	DFEVar m4 = constant.var(dfeUInt(64), m4Bits);
+
+    	x -= (x >> 1) & m1;
+    	x = (x & m2) + ((x >> 2) & m2);
+    	x = (x + (x >> 4)) & m4;
+    	x += x >>  8;
+    	x += x >> 16;
+    	x += x >> 32;
+    	
+    	return x & 0x7f;
+	}
+    
+	private DFEStruct shfQS(DFEVar misPos1, DFEVector<DFEVar> misPos1Sorted,
+							DFEVar misPos2, DFEVector<DFEVar> misPos2Sorted,
+							DFEVar low, DFEVector<DFEVar> lowSorted,
+							DFEVar high, DFEVector<DFEVar> highSorted,
+							DFEVar misQSVal1, DFEVar misSymVal1, DFEVector<DFEVar> qsMisSym1Sorted,
+							DFEVar misQSVal2, DFEVar misSymVal2, DFEVector<DFEVar> qsMisSym2Sorted,
+							DFEVector<DFEVar> isAlignedBck,
+							DFEVar isHit, DFEVar hitCnt,
+							DFEVar phase, DFEVar len, DFEVar id){
+		
+		DFEVar lenExtd = len.cast(dfeUInt(MAX_READ_LENGTH_BIT + 1)); 
+		
+		
+		//DFEVar misPos1flip = flipStg === 0 ? len - 1 - misPos1 : misPos1;
+		//DFEVar misPos2flip = flipStg === 0 ? len - 1 - misPos2 : misPos2;
+		DFEVar misPos1flip = phase === 0 | phase === 2? lenExtd - 1 - misPos1 : misPos1;
+		DFEVar misPos2flip = phase === 0 ? lenExtd - 1 - misPos2 : 
+							 phase === 1 ? misPos2 :
+								 (misPos2 - lenExtd);
+		
+		
+		DFEVectorType<DFEVar> misQS_gt_t = new DFEVectorType<DFEVar>(dfeUInt(1), N_HITS);
+		DFEVector<DFEVar> misQS_gt = misQS_gt_t.newInstance(this);
+		
+		// -- set bit mask
+		for (int i = 0; i < N_HITS; i++) {
+			misQS_gt[i] <== misQSVal1 + misQSVal2 >= 
+							qsMisSym1Sorted[i].slice(0, 6).cast(dfeUInt(6)) + qsMisSym2Sorted[i].slice(0, 6).cast(dfeUInt(6)) ? 
+							constant.var(dfeUInt(1), 1): constant.var(dfeUInt(1), 0);
+		}
+		
+		// -- calculate the insert position
+		DFEVar instPos = constant.var(dfeUInt(N_HITS_BIT), 0);
+		for (int i = 0; i < N_HITS; i++) {
+			instPos = instPos + misQS_gt[i].cast(dfeUInt(N_HITS_BIT));
+		}
+		
+		// -- insert the item, and shift them
+		// 1. create the instance based on the type
+		DFEVector<DFEVar> misPos1SortedNew = misPos_sorted_t.newInstance(this);
+		DFEVector<DFEVar> misPos2SortedNew = misPos_sorted_t.newInstance(this);
+		DFEVector<DFEVar> lowSortedNew = low_sorted_t.newInstance(this);
+		DFEVector<DFEVar> highSortedNew = high_sorted_t.newInstance(this);
+		DFEVector<DFEVar> qsMisSym1SortedNew = qs_misSym_sorted_t.newInstance(this);
+		DFEVector<DFEVar> qsMisSym2SortedNew = qs_misSym_sorted_t.newInstance(this);
+		DFEVector<DFEVar> isAlignedBckNew = is_aligned_bck_t.newInstance(this);
+		
+		DFEStruct hitScore = hitScore_t.newInstance(this);
+		
+		// 2. insert in the shift register
+		for (int i = 0; i < N_HITS-1; i++) {	
+			misPos1SortedNew[i] <== (instPos === 0 | isHit === false)? misPos1Sorted[i]:
+						(i === instPos-1)? misPos1flip.cast(dfeUInt(8)):
+						(i < instPos - 1)? misPos1Sorted[i+1]: misPos1Sorted[i];
+						
+			misPos2SortedNew[i] <== (instPos === 0 | isHit === false)? misPos2Sorted[i]:
+						(i === instPos-1)? misPos2flip.cast(dfeUInt(8)):
+						(i < instPos - 1)? misPos2Sorted[i+1]: misPos2Sorted[i];
+						
+			lowSortedNew[i] <== (instPos === 0 | isHit === false)? lowSorted[i]:
+							(i === instPos-1)? low:
+							(i < instPos - 1)? lowSorted[i+1]: lowSorted[i];
+							
+			highSortedNew[i] <== (instPos === 0 | isHit === false)? highSorted[i]:
+							(i === instPos-1)? high:
+							(i < instPos - 1)? highSorted[i+1]: highSorted[i];
+							
+			qsMisSym1SortedNew[i] <== (instPos === 0 | isHit === false)? qsMisSym1Sorted[i]:
+				(i === instPos-1)? misSymVal1.cat(misQSVal1).cast(dfeUInt(8))  :
+				(i < instPos - 1)? qsMisSym1Sorted[i+1]: qsMisSym1Sorted[i];
+				
+			qsMisSym2SortedNew[i] <== (instPos === 0 | isHit === false)? qsMisSym2Sorted[i]:
+					(i === instPos-1)? misSymVal2.cat(misQSVal2).cast(dfeUInt(8))  :
+					(i < instPos - 1)? qsMisSym2Sorted[i+1]: qsMisSym2Sorted[i];	
+					
+			isAlignedBckNew[i] <== (instPos === 0 | isHit === false)? isAlignedBck[i]:
+					(i === instPos-1)?  
+							(phase === 2 | phase === 1)? constant.var(dfeUInt(1), 0):constant.var(dfeUInt(1),1):
+					(i < instPos - 1)? isAlignedBck[i+1]: isAlignedBck[i];	
+		}
+		// the boundary condition
+		misPos1SortedNew[N_HITS-1] <== (instPos === N_HITS & isHit === true )? misPos1flip.cast(dfeUInt(8)): misPos1Sorted[N_HITS-1];
+		misPos2SortedNew[N_HITS-1] <== (instPos === N_HITS & isHit === true )? misPos2flip.cast(dfeUInt(8)): misPos2Sorted[N_HITS-1];
+		lowSortedNew[N_HITS-1] 	<== (instPos === N_HITS & isHit === true )? low: lowSorted[N_HITS-1];
+		highSortedNew[N_HITS-1] <== (instPos === N_HITS & isHit === true )? high: highSorted[N_HITS-1];
+		qsMisSym1SortedNew[N_HITS-1] <== (instPos === N_HITS & isHit === true )? misSymVal1.cat(misQSVal1).cast(dfeUInt(8)): qsMisSym1Sorted[N_HITS-1];
+		qsMisSym2SortedNew[N_HITS-1] <== (instPos === N_HITS & isHit === true )? misSymVal2.cat(misQSVal2).cast(dfeUInt(8)): qsMisSym2Sorted[N_HITS-1];
+		isAlignedBckNew[N_HITS-1] <== (instPos === N_HITS & isHit === true )? 
+																			(phase === 2 | phase === 1)? constant.var(dfeUInt(1), 0):constant.var(dfeUInt(1),1)
+																			: isAlignedBck[N_HITS-1];
+		//isRevCmptNew[N_HITS-1] <== (instPos === N_HITS & isHit === true )? 
+				//(flipStg === 0)? constant.var(dfeUInt(1), 0):constant.var(dfeUInt(1),1)
+				//: isRevCmpt[N_HITS-1];
+		
+		hitScore.set("id", id);
+		hitScore.set("nHits", hitCnt.cast(dfeUInt(8)));
+		hitScore.set("pad", constant.var(dfeUInt(HIT_PAD), 0));
+		
+		hitScore.set("misPos1Sorted", misPos1SortedNew);
+		hitScore.set("misPos2Sorted", misPos2SortedNew);
+		hitScore.set("lowSorted", lowSortedNew);
+		hitScore.set("highSorted", highSortedNew);
+		hitScore.set("qsMisSym1Sorted", qsMisSym1SortedNew);
+		hitScore.set("qsMisSym2Sorted", qsMisSym2SortedNew);
+		hitScore.set("isAlignedBck", isAlignedBckNew);
+		//hitScore.set("isRevCmpt", isRevCmptNew);
+		
+		/*debug.simPrintf(id === 3, "\n\n\n ^^^^^^^^^^^^ The updated sort Quality Score1 %d Score2 %d %d\n", misQSVal1, misQSVal2, instPos);
+		for (int i = 0; i < N_HITS; i++){
+			debug.simPrintf(id === 3, "%d: A %d , B %d ", i, 
+					qsMisSym1Sorted[i].slice(0, 6).cast(dfeUInt(6)), qsMisSym1SortedNew[i].slice(0, 6).cast(dfeUInt(6)));
+		}
+		debug.simPrintf(id === 3, "\n");
+		for (int i = 0; i < N_HITS; i++){
+			debug.simPrintf(id === 3, "%d: A %d , B %d ", i, 
+					qsMisSym2Sorted[i].slice(0, 6).cast(dfeUInt(6)), qsMisSym2SortedNew[i].slice(0, 6).cast(dfeUInt(6)));
+		}
+		
+		debug.simPrintf(id === 3, "\n\n\n ^^^^^^^^^^^^ The updated sort lowNew %d \n", low);
+		for (int i = 0; i < N_HITS; i++){
+			debug.simPrintf(id === 3, " %d: O, %d N, %d ", i, lowSorted[i], lowSortedNew[i]);
+		}
+		
+		debug.simPrintf(id === 3, "\n\n\n >>>>>>>>>>>>> The updated sort highNew %d \n", high);
+		for (int i = 0; i < N_HITS; i++){
+			debug.simPrintf(id === 3, " %d: O, %d N, %d ", i, highSorted[i], highSortedNew[i]);
+		}
+		
+		debug.simPrintf(id === 3, "\n\n\n ||||||||||||| The updated sort misPos1Sorted %d \n", misPos1flip);
+		for (int i = 0; i < N_HITS; i++){
+			debug.simPrintf(id === 3, " %d: O, %d N, %d ", i, misPos1Sorted[i], misPos1SortedNew[i]);
+		}
+	
+		debug.simPrintf(id === 3, "\n\n\n ||||||||||||| The updated sort misPos2Sorted %d \n", misPos2flip);
+		for (int i = 0; i < N_HITS; i++){
+			debug.simPrintf(id === 3, " %d: O, %d N, %d ", i, misPos2Sorted[i], misPos2SortedNew[i]);
+		}
+		
+		debug.simPrintf(id === 3, "\n\n\n ||||||||||||| The updated sort misSym1Sorted %d misSym2Sorted %d\n", misSymVal1, misSymVal2);
+		for (int i = 0; i < N_HITS; i++){
+			debug.simPrintf(id === 3, " %d: O, %d N, %d ", i, 
+					qsMisSym1Sorted[i].slice(6, 2).cast(dfeUInt(2)), qsMisSym1SortedNew[i].slice(6, 2).cast(dfeUInt(2)));
+		}
+		for (int i = 0; i < N_HITS; i++){
+			debug.simPrintf(id === 3, " %d: O, %d N, %d ", i, 
+					qsMisSym2Sorted[i].slice(6, 2).cast(dfeUInt(2)), qsMisSym2SortedNew[i].slice(6, 2).cast(dfeUInt(2)));
+		}
+		debug.simPrintf(id === 3, "\n\n\n ||||||||||||| The updated hit %d \n", hitCnt);*/
+		
+		return hitScore;
+	}
+
+}
