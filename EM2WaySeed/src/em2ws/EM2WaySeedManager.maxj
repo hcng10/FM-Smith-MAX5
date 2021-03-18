@@ -1,0 +1,225 @@
+package em2ws;
+
+
+import com.maxeler.maxcompiler.v2.build.EngineParameters;
+import com.maxeler.maxcompiler.v2.kernelcompiler.KernelConfiguration;
+import com.maxeler.maxcompiler.v2.kernelcompiler.KernelConfiguration.SimulationOptions.SimulationBehaviour;
+import com.maxeler.maxcompiler.v2.managers.custom.DFELink;
+import com.maxeler.maxcompiler.v2.managers.custom.blocks.Fanout;
+import com.maxeler.maxcompiler.v2.managers.custom.blocks.KernelBlock;
+import com.maxeler.maxcompiler.v2.managers.custom.stdlib.LMemCommandGroup;
+import com.maxeler.maxcompiler.v2.managers.custom.stdlib.LMemInterface;
+import com.maxeler.maxcompiler.v2.managers.engine_interfaces.CPUTypes;
+import com.maxeler.maxcompiler.v2.managers.engine_interfaces.EngineInterface;
+import com.maxeler.maxcompiler.v2.managers.engine_interfaces.EngineInterface.Direction;
+import com.maxeler.maxcompiler.v2.managers.engine_interfaces.InterfaceParam;
+import com.maxeler.maxcompiler.v2.managers.engine_interfaces.InterfaceParamArray;
+import com.maxeler.maxeleros.managercompiler.configuration.ManagerConfiguration;
+import com.maxeler.platform.max5.board.Max5MaxelerOsPlatform;
+import com.maxeler.platform.max5.manager.BuildConfig;
+import com.maxeler.platform.max5.manager.BuildConfig.OptimizationGoal;
+import com.maxeler.platform.max5.manager.ImplementationStrategy;
+import com.maxeler.platform.max5.manager.MAX5CManager;
+
+import com.maxeler.maxcompiler.v2.managers.custom.api.ManagerLogging;
+
+public class EM2WaySeedManager extends MAX5CManager {
+
+	public static final String EMKernelName = "EMSeedKernel";
+	public static final String MemCmdKernelName = "CmdKernel";
+	
+	private static final int N_KRNL = 1;
+	
+
+	public EM2WaySeedManager(EngineParameters params) {
+		super(params);
+		
+		//build config
+		ManagerConfiguration config = this.getManagerConfig();
+	    config.setStreamClockFrequencyMHz(200);
+	    
+	    
+	    BuildConfig buildConfig = this.getBuildConfig();
+	    buildConfig.setBuildEffort(BuildConfig.Effort.HIGH);
+	    setupMax5(buildConfig);
+	    //buildConfig.setOptimizationGoal(OptimizationGoal.AREA);
+
+	       
+	    LMemGlobalConfig memConfig = this.getLMemGlobalConfig();
+	    memConfig.setMemoryFrequency(LMemFrequency.LMEM_1200MHZ);   
+		
+		// instantiate memory controllers
+		LMemInterface[] iface = new  LMemInterface[N_KRNL];
+		for (int i = 0; i < N_KRNL; i++) {
+			iface[i] = addLMemInterface("ctrl" + i, 1);
+		}
+		
+		for (int i = 0; i < N_KRNL; i++) {
+			KernelBlock kEM = addKernel(new EMSeedKernel(makeKernelParameters(EMKernelName + i)));
+			KernelBlock kCmd = addKernel(new CmdKernel(makeKernelParameters(MemCmdKernelName + i)));	
+			
+			DFELink readIn = addStreamFromCPU("readIn" + i);
+			kEM.getInput("readIn") <== readIn;
+			
+			DFELink alignOut = addStreamToCPU("alignOut" + i);
+			alignOut <== kEM.getOutput("alignOut");
+
+			// seed output
+			DFELink seedOut = addStreamToCPU("seedOut" + i);
+			seedOut <== kEM.getOutput("seedOut");			
+			
+			kCmd.getInput("memCmd") <== kEM.getOutput("memCmd");
+			kCmd.getInput("flushTrig") <== kEM.getOutput("flushTrig");
+			
+		    DFELink lowIndex = iface[i].addStreamFromLMem("lowIndex" + i, kCmd.getOutput("lowCmd"));
+		    DFELink highIndex = iface[i].addStreamFromLMem("highIndex" + i, kCmd.getOutput("highCmd"));
+		    kEM.getInput("lowIndex") <== lowIndex;
+		    kEM.getInput("highIndex") <== highIndex;
+			
+		}
+		
+
+		// index to LMem
+		DFELink EMIndexToMger = addStreamFromCPU("EMIndexToMger");
+		
+		Fanout fanInLMem = fanout("fanInLMem");
+		fanInLMem.getInput() <== EMIndexToMger;
+
+		for (int i = 0; i < N_KRNL; i++) {
+		    DFELink fanOutLMem = fanInLMem.addOutput("fanOutLMem" + i);
+		    DFELink fanToLMem = iface[i].addStreamToLMem("indexToLMem" + i, 
+					 LMemCommandGroup.MemoryAccessPattern.LINEAR_1D);
+		    
+		    fanToLMem <== fanOutLMem;
+		    
+		}
+		
+	}
+	
+	
+	static void setupMax5(BuildConfig buildConf) {//, KernelConfiguration kernelConfig
+		buildConf.setImplementationStrategies(getImpStrategies());
+		buildConf.setParallelism(2);
+		buildConf.setImplementationNearMissRetries(4);
+		buildConf.setImplementationNearMissThreshold(2000);
+		//kernelConfig.optimization.setUseGlobalClockBuffer(true);
+		//kernelConfig.debug.setEnableLatencyAnnotation(true);
+		//kernelConfig.simulation.setRAMAddressCollisionBehaviour(SimulationBehaviour.IGNORE);
+		//kernelConfig.optimization.setTriAddsEnabled(false); // TODO: Check if helped
+	}
+
+	static ImplementationStrategy[] getImpStrategies() {
+		ImplementationStrategy[] strats = {ImplementationStrategy.VIVADO_DEFAULT, 
+		ImplementationStrategy.MAXELER1, ImplementationStrategy.MAXELER2,
+		ImplementationStrategy.MAXELER3, ImplementationStrategy.MAXELER4,
+		ImplementationStrategy.PERFORMANCE_EXPLORE, ImplementationStrategy.PERFORMANCE_NET_DELAY_HIGH,
+		ImplementationStrategy.CONGESTION_SPREAD_LOGIC_HIGH, ImplementationStrategy.CONGESTION_SPREAD_LOGIC_EXPLORE,
+		ImplementationStrategy.AREA_EXPLORE_WITH_REMAP, ImplementationStrategy.PERFORMANCE_EXTRA_TIMING_OPT,
+		ImplementationStrategy.PERFORMANCE_NET_DELAY_LOW,
+		
+		ImplementationStrategy.PERFORMANCE_EARLY_BLOCK_PLACEMENT,
+		ImplementationStrategy.PERFORMANCE_REFINE_PLACEMENT,
+		ImplementationStrategy.PERFORMANCE_RETIMING
+		};
+		return strats;
+	}
+	
+    // write engine interface
+    private static EngineInterface interfaceWrite(String name) {
+    	
+    	EngineInterface ei = new EngineInterface(name); 	
+
+    	InterfaceParam offset = ei.addParam("offset", CPUTypes.UINT64);
+    	InterfaceParam nBytes  = ei.addParam("nBytes", CPUTypes.UINT64);
+    	
+    	ei.setStream("EMIndexToMger", CPUTypes.UINT64, nBytes);
+    	/*for (int i = 0; i < N_KRNL; i++) {
+    		ei.setStream("EMIndexToFPGA" + i, CPUTypes.UINT64, nBytes);
+    	}*/
+    	
+    	for (int i = 0; i < N_KRNL; i++) {
+    	    ei.setLMemLinear("ctrl" + i, "indexToLMem" + i, offset, nBytes);
+    	    ei.ignoreLMem("lowIndex" + i);
+    	    ei.ignoreLMem("highIndex" + i);
+    	}	
+    	
+    	String routeString = "";
+    	for (int i = 0; i < N_KRNL; i++) {
+    		String tmp = String.format("fanInLMem -> fanOutLMem%d", i);
+    		if (i < N_KRNL-1)
+    			tmp += ", ";
+    	    routeString += tmp;
+    	}
+    	
+    	ei.route(routeString);
+    	ei.ignoreAll(Direction.IN_OUT);
+    	
+    	return ei;
+    }
+    
+    // write engine interface
+    private static EngineInterface interfaceAlign(String name) {
+    	
+    	EngineInterface ei = new EngineInterface(name);
+    	
+    	InterfaceParam offset = ei.addParam("offset", CPUTypes.UINT32);
+    	
+    	InterfaceParam highInit = ei.addParam("highInit", CPUTypes.UINT32);
+    	
+    	InterfaceParam endCharBucket = ei.addParam("endCharBucket", CPUTypes.UINT32);
+    	InterfaceParam endCharBucketi = ei.addParam("endCharBucketi", CPUTypes.UINT32);
+		
+		InterfaceParam isSeeding = ei.addParam("isSeeding", CPUTypes.UINT32);
+
+		InterfaceParam reSeedNum = ei.addParam("reSeedNum", CPUTypes.UINT32);
+		InterfaceParam reSeedThld = ei.addParam("reSeedThld", CPUTypes.UINT32);
+
+    	InterfaceParam seedLen = ei.addParam("seedLen", CPUTypes.UINT32);
+
+    	InterfaceParamArray nBytesInput = ei.addParamArray("nBytesInput", CPUTypes.UINT64);
+    	InterfaceParamArray nBytesOutput = ei.addParamArray("nBytesOutput", CPUTypes.UINT64);
+    	InterfaceParamArray nBytesSeedOutput = ei.addParamArray("nBytesSeedOutput", CPUTypes.UINT64);
+    	
+    	for (int i = 0; i < N_KRNL; i++) {
+    		ei.setScalar(EMKernelName + i, "offset", offset);	
+    		
+    		ei.setScalar(EMKernelName + i, "highInit", highInit);		
+    		
+    		ei.setScalar(EMKernelName + i, "endCharBucket", endCharBucket);
+			ei.setScalar(EMKernelName + i, "endCharBucketi", endCharBucketi);
+			
+			ei.setScalar(EMKernelName + i, "isSeeding", isSeeding);
+
+			ei.setScalar(EMKernelName + i, "reSeedNum", reSeedNum);
+			ei.setScalar(EMKernelName + i, "reSeedThld", reSeedThld);
+			
+    		ei.setScalar(EMKernelName + i, "seedLen", seedLen);
+    		
+    	    ei.setStream("readIn" + i, CPUTypes.UINT64, nBytesInput.get(i));
+    	    ei.setStream("alignOut" + i, CPUTypes.UINT64, nBytesOutput.get(i));
+    	    ei.setStream("seedOut" + i, CPUTypes.UINT64, nBytesSeedOutput.get(i));
+
+			 	    
+    	    ei.ignoreLMem("indexToLMem" + i);
+    	    ei.ignoreLMem("lowIndex" + i);
+    	    ei.ignoreLMem("highIndex" + i);
+    	}
+    	
+		
+    	ei.ignoreAll(Direction.IN_OUT);
+    	    	
+    	return ei;
+    	
+    }
+
+	public static void main(final String[] argv) {
+		final EngineParameters params = new EngineParameters(argv);
+		final EM2WaySeedManager manager = new EM2WaySeedManager(params);
+		
+		manager.createSLiCinterface(interfaceWrite("Write"));
+		manager.createSLiCinterface(interfaceAlign("Align"));
+		
+		manager.build();
+	}
+
+}
