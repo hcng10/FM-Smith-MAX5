@@ -1,0 +1,884 @@
+package smith;
+
+import static com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEStructType.sft;
+
+import com.maxeler.maxcompiler.v2.kernelcompiler.Kernel;
+import com.maxeler.maxcompiler.v2.kernelcompiler.KernelParameters;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.KernelMath;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.Reductions;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count.Counter;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count.WrapMode;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.memory.Memory;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.base.DFEVar;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEStructType;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEVectorType;
+import com.maxeler.maxcompiler.v2.kernelcompiler.RoundingMode;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEStruct;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEStructType;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEVector;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEVectorType;
+import com.maxeler.maxcompiler.v2.utils.Bits;
+
+public class SmithAlphaKernel extends Kernel {
+	
+    // maximum sequence size
+	private static final int MAXREADLEN = 104;
+	private static final int MAXREFLEN = 160;
+	private static final int PADSIZE = 72;
+	
+	private static final int SCORE_BIT = 10;
+	private static final int BRAM_ADDR_BIT = 32;
+	private static final int INTERLEAVE = 25;
+	//private static final int MAX_INTERLEAVE = 40;
+	
+	private static final int RSLT_TAIL_ALIGN = 1;
+	private static final int BOOL_BIT = 8;
+	private static final int MAX_SCORE_BIT = 16;
+	private static final int RSLT_PADSIZE = 24;
+	
+	private static final int INTERLEAVE_PWR = 
+			(int) (Math.log((double)(INTERLEAVE)) / Math.log(2.0));
+	
+	private static final int BLK_RAM_ADDR_PWR = 
+			(int) (Math.log((double)((MAXREADLEN + MAXREFLEN - 1)*INTERLEAVE)) / Math.log(2.0)) + 1;
+	
+	// --- initialize the memory storing the score matrix
+	DFEVectorType<DFEVar> score_t = new DFEVectorType<DFEVar>(dfeUInt(SCORE_BIT), MAXREADLEN);
+
+	DFEVectorType<DFEVar> rsltType_t = new DFEVectorType<DFEVar>(dfeUInt(2), MAXREADLEN + MAXREFLEN - 1 + RSLT_TAIL_ALIGN);
+	
+	public SmithAlphaKernel(final KernelParameters parameters) {
+		super(parameters);
+
+		
+		// packed symbols -- 3 bits per symbol
+		DFEVectorType<DFEVar> read_t = new DFEVectorType<DFEVar>(dfeUInt(3), MAXREADLEN);
+		DFEVectorType<DFEVar> qs_t = new DFEVectorType<DFEVar>(dfeUInt(6), MAXREADLEN);
+		DFEVectorType<DFEVar> ref_t = new DFEVectorType<DFEVar>(dfeUInt(3), MAXREFLEN);
+		
+		// ** Inputs
+		// stream structure
+		DFEStructType in_t = new DFEStructType(
+							  sft("id", dfeUInt(32)),
+							  sft("read", read_t),
+							  sft("readLen", dfeUInt(8)),
+							  sft("ref", ref_t),
+							  sft("refLen", dfeUInt(8)),
+							  sft("qs", qs_t),
+							  sft("isPad", dfeUInt(PADSIZE)));
+
+
+		
+		// sys array for streaming ref
+		DFEVectorType<DFEVar> sysArray_t = new DFEVectorType<DFEVar>(dfeUInt(3), MAXREFLEN);
+
+		
+		
+		// kernel control counters
+		DFEVar interleave = io.scalarInput("interleave", dfeInt(32));
+		DFEVar tickCount = control.count.simpleCounter(32, interleave.cast(dfeUInt(32)));
+		DFEVar tickInit = control.count.pulse(1, tickCount === interleave.cast(dfeUInt(32)) - 1);
+		
+		
+		// input stream control
+		DFEVar inputCtrlPostBuffed = dfeBool().newInstance(this);
+		DFEVar inputCtrl = tickInit === 1 ? constant.var(true) : inputCtrlPostBuffed;
+		
+		// kernel input
+		// --- pci-e
+		DFEStruct seqIn = io.input("seqIn", in_t, inputCtrl === true);
+		
+		
+		// -- scalar input
+		DFEVar maScore = io.scalarInput("MA", dfeUInt(8));// default 2
+		DFEVar mnScore = io.scalarInput("MN", dfeUInt(8));// default 2
+		DFEVar mxScore = io.scalarInput("MX", dfeUInt(8));// default 6
+		
+		DFEVar npScore = io.scalarInput("NP", dfeUInt(8));// default 1
+		
+		DFEVar rdgOpenScore = io.scalarInput("RDG_OPEN", dfeUInt(8));// default 5
+		DFEVar rdgExtendScore = io.scalarInput("RDG_EXTEND", dfeUInt(8));// default 3
+		
+		// del
+		DFEVar rfgOpenScore = io.scalarInput("RFG_OPEN", dfeUInt(8));// default 5
+		DFEVar rfgExtendScore = io.scalarInput("RFG_EXTEND", dfeUInt(8));// default 3	
+
+		DFEVar thresholdScoreIn = io.scalarInput("thresholdScoreIn", dfeUInt(32));
+		DFEVar thresholdScore = thresholdScoreIn.cast(dfeUInt(SCORE_BIT));
+		
+		// set up streams
+		// ---pci-e
+		DFEVar idIn = seqIn.get("id");
+		DFEVar idBuffed = dfeUInt(32).newInstance(this);
+		DFEVar id = inputCtrl === true ? idIn : idBuffed;
+			
+		DFEVector<DFEVar> readIn = seqIn.get("read");
+		DFEVector<DFEVar> readBuffed = read_t.newInstance(this);
+		DFEVector<DFEVar> read = inputCtrl === true ? readIn : readBuffed;
+		
+		DFEVar readLenIn = seqIn.get("readLen");
+		DFEVar readLenBuffed = dfeUInt(8).newInstance(this);
+		DFEVar readLen = inputCtrl === true ? readLenIn : readLenBuffed;	
+		DFEVar readLen32 = readLen.cast(dfeUInt(32));
+		DFEVar readLen11 = readLen.cast(dfeUInt(11));
+		
+		DFEVector<DFEVar> refIn = seqIn.get("ref");
+		DFEVector<DFEVar> refBuffed = ref_t.newInstance(this);
+		DFEVector<DFEVar> ref = inputCtrl === true ? refIn : refBuffed;
+		
+		DFEVar refLenIn = seqIn.get("refLen");
+		DFEVar refLenBuffed = dfeUInt(8).newInstance(this);
+		DFEVar refLen = inputCtrl === true ? refLenIn : refLenBuffed;	
+		DFEVar refLen32 = refLen.cast(dfeUInt(32));
+		
+		DFEVector<DFEVar> qsIn = seqIn.get("qs");
+		DFEVector<DFEVar> qsBuffed = qs_t.newInstance(this);
+		DFEVector<DFEVar> qs = inputCtrl === true ? qsIn : qsBuffed;
+		
+		DFEVar isPadIn = seqIn.get("isPad");
+		DFEVar isPadBuff = dfeUInt(PADSIZE).newInstance(this);
+		DFEVar isPad = inputCtrl === true ? isPadIn : isPadBuff;
+		
+		
+		DFEVar idPadCovert = isPad.cast(dfeUInt(8));
+		
+		
+		
+		// --- systolic array
+		DFEVector<DFEVar> sysArrayBuffed = sysArray_t.newInstance(this);
+		DFEVector<DFEVar> sysArray = inputCtrl === true ? constant.vect(MAXREFLEN, dfeUInt(3), 5): sysArrayBuffed;// 5 doesn't represent any base pair
+		
+		DFEVector<DFEVar> preSysArrayBuffed = sysArray_t.newInstance(this);
+		DFEVector<DFEVar> preSysArray = inputCtrl === true ? constant.vect(MAXREFLEN, dfeUInt(3), 5): preSysArrayBuffed;
+		
+		// the new systolic is the one with value shifted,
+		// we use this one for calculation
+		DFEVector<DFEVar> sysArrayNew = sysArray_t.newInstance(this);
+		DFEVector<DFEVar> preSysArrayNew = sysArray_t.newInstance(this);
+		
+		
+		// shifting in Systolic Array, so that the ref is now in correct place
+		for (int i = 0; i < MAXREFLEN-1; i++) {
+			preSysArrayNew[i] <== inputCtrl === true ? 
+										(i+1 < refLenIn) ? refIn[i+1] : constant.var(dfeUInt(3), 5)
+										: preSysArray[i+1];
+		}
+		preSysArrayNew[MAXREFLEN-1] <== constant.var(dfeUInt(3), 5);
+										
+		for (int i = 1; i < MAXREFLEN; i++) {
+			sysArrayNew[i] <== inputCtrl === true ? constant.var(dfeUInt(3), 5): sysArray[i-1];
+			//sysArrayNew[MAXREFLEN-2-i] <== inputCtrl === true ? constant.var(dfeUInt(3), 5): sysArray[MAXREFLEN-1-i];
+		}
+		sysArrayNew[0] <== inputCtrl === true ? refIn[0]: preSysArray[0];
+		
+		
+		//**INSERT DELETE refer to the read */
+		
+		// buffer the last anti-diagonal of score with LUTs and FIFO
+		DFEVector<DFEVar> vScore1ColBuffed = score_t.newInstance(this);
+		DFEVector<DFEVar> vScore1Col = inputCtrl === true ? constant.vect(MAXREADLEN, dfeUInt(SCORE_BIT), 1023): vScore1ColBuffed;
+		
+		DFEVector<DFEVar> vScore2ColBuffed = score_t.newInstance(this);
+		DFEVector<DFEVar> vScore2Col = inputCtrl === true ? constant.vect(MAXREADLEN, dfeUInt(SCORE_BIT), 1023): vScore2ColBuffed;
+		DFEVector<DFEVar> vScoreNew = score_t.newInstance(this);
+		
+		//  Si,j,->
+		DFEVector<DFEVar> sDelScoreBuffed = score_t.newInstance(this);
+		DFEVector<DFEVar> sDelScore = inputCtrl === true ? constant.vect(MAXREADLEN, dfeUInt(SCORE_BIT), 1023): sDelScoreBuffed;
+		DFEVector<DFEVar> sDelScoreNew = score_t.newInstance(this);
+		
+		//  Si,j, ↓
+		DFEVector<DFEVar> sInsScoreBuffed = score_t.newInstance(this);
+		DFEVector<DFEVar> sInsScore = inputCtrl === true ? constant.vect(MAXREADLEN, dfeUInt(SCORE_BIT), 1023): sInsScoreBuffed;
+		DFEVector<DFEVar> sInsScoreNew = score_t.newInstance(this);
+		
+		
+		// --- local variable
+		DFEVar idxBuffed = dfeUInt(32).newInstance(this);
+		DFEVar idx = inputCtrl === true ? constant.var(dfeUInt(32), 0) : idxBuffed;
+		
+	
+		
+		// --- calculate the score matrix
+		// First row		
+		//Si,j,-> (del)
+		sDelScoreNew[0] <== idx < refLen32 ? constant.var(dfeUInt(SCORE_BIT), 0): constant.var(dfeUInt(SCORE_BIT), 1023);
+		
+		//Si,j, ↓ (ins)
+		DFEVar sInsTmp1 = vScore1Col[0] > rdgOpenScore.cast(dfeUInt(SCORE_BIT)) ? vScore1Col[0] - rdgOpenScore.cast(dfeUInt(SCORE_BIT)): 0;
+		DFEVar sInsTmp2 = sInsScore[0] > rdgExtendScore.cast(dfeUInt(SCORE_BIT)) ? sInsScore[0] - rdgExtendScore.cast(dfeUInt(SCORE_BIT)):0;
+		DFEVar maxIns0 = KernelMath.max(sInsTmp1, sInsTmp2);	
+		
+		maxIns0 = idx === 0 ? constant.var(dfeUInt(SCORE_BIT), 0): maxIns0;
+		
+		sInsScoreNew[0] <== idx < refLen32? maxIns0: constant.var(dfeUInt(SCORE_BIT), 1023);
+
+		
+		//Vij
+		//**match/mismatch comparison**
+		DFEVar mxMinusMn = mxScore - mnScore;
+		
+		DFEVar sigma0 = (sysArrayNew[0] === constant.var(dfeUInt(3), 5) | read[0] === constant.var(dfeUInt(3), 5) |
+						sysArrayNew[0] === constant.var(dfeUInt(3), 4) | read[0] === constant.var(dfeUInt(3), 4))? constant.var(dfeUInt(8), 0):
+							(sysArrayNew[0] === read[0])? maScore: constant.var(dfeUInt(8), 0);
+						
+		//if statement to check if the bottom half of the diagonal
+		DFEVar finalVScore0 = KernelMath.max(constant.var(dfeUInt(SCORE_BIT), 0), sigma0.cast(dfeUInt(SCORE_BIT)));
+		finalVScore0 = KernelMath.max(finalVScore0, maxIns0);
+		
+		
+		//sigma0.cast(dfeUInt(SCORE_BIT))
+		vScoreNew[0] <== idx < refLen32 ? finalVScore0 : constant.var(dfeUInt(SCORE_BIT), 1023);
+		
+
+		for (int i = 1; i < MAXREADLEN; i++) {
+			//**del**
+			DFEVar sDelTmp1 = vScore1Col[i-1] > rfgOpenScore.cast(dfeUInt(SCORE_BIT)) ? vScore1Col[i-1] - rfgOpenScore.cast(dfeUInt(SCORE_BIT)): 0;
+			DFEVar sDelTmp2 = sDelScore[i-1] > rfgExtendScore.cast(dfeUInt(SCORE_BIT)) ? sDelScore[i-1] - rfgExtendScore.cast(dfeUInt(SCORE_BIT)): 0;
+			DFEVar maxDel = KernelMath.max(sDelTmp1, sDelTmp2);
+			
+			// COND1: At the top left of the diagonal					
+			// COND2: At the bottom right of the diagonal
+			// COND3: Bigger than the readLen
+			DFEVar delScore = ((idx < readLen32 - 1) & i > idx) | 
+									(idx >= refLen32 & i < (idx - refLen32 + 1)) | 
+										i >=  readLen32? constant.var(dfeUInt(SCORE_BIT), 1023): maxDel;
+			sDelScoreNew[i] <== delScore;
+						
+			
+			//**ins**
+			sInsTmp1 = i < idx & vScore1Col[i] > rdgOpenScore.cast(dfeUInt(SCORE_BIT)) ? vScore1Col[i] - rdgOpenScore.cast(dfeUInt(SCORE_BIT)): 0;
+			sInsTmp2 = i < idx & sInsScore[i] > rdgExtendScore.cast(dfeUInt(SCORE_BIT)) ? sInsScore[i] - rdgExtendScore.cast(dfeUInt(SCORE_BIT)):0;
+			DFEVar maxIns = KernelMath.max(sInsTmp1, sInsTmp2);	
+			
+			DFEVar insScore = ((idx < readLen32 - 1) & i > idx) | 
+					(idx >= refLen32 & i < (idx - refLen32 + 1)) | 
+						i >= readLen32? constant.var(dfeUInt(SCORE_BIT), 1023): maxIns;
+			sInsScoreNew[i] <== insScore;			
+			
+			//**match/mismatch comparison**
+			
+			// COND1: leftmost column
+			// COND2: Other cases
+			// COND3: Out of the range of endLen + refLen - 1 
+			DFEVar VijBothMinus1 = idx === i & idx < readLen32 ? constant.var(dfeUInt(SCORE_BIT), 0):
+								idx < readLen32 + refLen32 - 1 ? vScore2Col[i-1]: 
+									constant.var(dfeUInt(SCORE_BIT), 1023);
+			
+			//**match/mismatch comparison**
+			//DFEVar mxMinusMn = mxScore - mnScore;
+			DFEVar minQS40	= KernelMath.min(qs[i], constant.var(dfeUInt(6), 40));	
+			DFEVar mismatchTmp = (minQS40.cast(dfeFloat(8, 24)) / 40) * mxMinusMn.cast(dfeFloat(8, 24));
+			mismatchTmp =  KernelMath.floor(mismatchTmp);
+			DFEVar mismatchScore = mismatchTmp.cast(dfeUInt(8)) + mnScore.cast(dfeUInt(8)) ;
+			
+			
+			//debug.simPrintf(id === 75 & i < idx, "i:%d, QS[i]: %d Decimial %.3g \n", i, qs[i], mismatchTmp);
+			
+			// COND1: Over the range comparison
+			// COND2: N char
+			// COND3: Match
+			// COND4: Mismatch
+			DFEVar sigma = 
+					(sysArrayNew[i] === constant.var(dfeUInt(3), 5) | read[i] === constant.var(dfeUInt(3), 5))? constant.var(dfeUInt(8), 0):
+					(sysArrayNew[i] === constant.var(dfeUInt(3), 4) | read[i] === constant.var(dfeUInt(3), 4))? npScore:
+					sysArrayNew[i] === read[i]? maScore: mismatchScore;//TODO: need to change based on QS 
+					
+			// control signals to help out with calculation
+			DFEVar isMatch = 
+					(sysArrayNew[i] === constant.var(dfeUInt(3), 5) | read[i] === constant.var(dfeUInt(3), 5))? constant.var(false):
+					(sysArrayNew[i] === constant.var(dfeUInt(3), 4) | read[i] === constant.var(dfeUInt(3), 4))? constant.var(false):
+					sysArrayNew[i] === read[i]? constant.var(true):
+						constant.var(false);
+					
+			DFEVar matchMismatchScore = 
+					isMatch === true ? VijBothMinus1 + sigma.cast(dfeUInt(SCORE_BIT)): 
+						VijBothMinus1 >= sigma.cast(dfeUInt(SCORE_BIT)) ? VijBothMinus1 - sigma.cast(dfeUInt(SCORE_BIT)): 0;
+						
+			DFEVar finalVScore = KernelMath.max(constant.var(dfeUInt(SCORE_BIT), 0), matchMismatchScore);
+			finalVScore = KernelMath.max(finalVScore, maxDel);
+			finalVScore = KernelMath.max(finalVScore, maxIns);
+
+			// COND1: At the top left of the diagonal
+			// COND2: At the bottom right of the diagonal
+			// COND3: Bigger than the readLen
+		    // COND4: Shouldn't appear but in case the previous score is undefined 
+						//| VijBothMinus1 === constant.var(dfeUInt(SCORE_BIT), 1023) ? 
+			vScoreNew[i] <== ((idx < readLen32 - 1) & i > idx) |
+								(idx >= refLen32 & i < (idx - refLen32 + 1)) | 
+									i >=  readLen32 ?
+						constant.var(dfeUInt(SCORE_BIT), 1023): finalVScore;
+						
+
+		}
+		
+		/*****get the max score on the fly*****/
+		
+		// store the max value in the last row
+		DFEVar maxFinalScoreBuffed =  dfeUInt(SCORE_BIT).newInstance(this);
+		DFEVar maxFinalScore = inputCtrl === true ? constant.var(dfeUInt(SCORE_BIT), 0) : maxFinalScoreBuffed;
+		DFEVar maxFinalScoreNew = dfeUInt(SCORE_BIT).newInstance(this);
+
+		DFEVar maxFinalsDelBuffed =  dfeUInt(SCORE_BIT).newInstance(this);
+		DFEVar maxFinalsDel = inputCtrl === true ? constant.var(dfeUInt(SCORE_BIT), 0) : maxFinalsDelBuffed;
+		DFEVar maxFinalsDelNew = dfeUInt(SCORE_BIT).newInstance(this);
+
+		DFEVar maxFinalsInsBuffed =  dfeUInt(SCORE_BIT).newInstance(this);
+		DFEVar maxFinalsIns = inputCtrl === true ? constant.var(dfeUInt(SCORE_BIT), 0) : maxFinalsInsBuffed;
+		DFEVar maxFinalsInsNew = dfeUInt(SCORE_BIT).newInstance(this);
+	
+		DFEVar maxFinalLocBuffed =  dfeUInt(BRAM_ADDR_BIT).newInstance(this);
+		DFEVar maxFinalLoc = inputCtrl === true ? constant.var(dfeUInt(BRAM_ADDR_BIT), 0) : maxFinalLocBuffed;
+		DFEVar maxFinalLocNew =  dfeUInt(BRAM_ADDR_BIT).newInstance(this);
+
+		////DFEVar maxFinalScoreMinusBuffed =  dfeUInt(SCORE_BIT).newInstance(this);
+		////DFEVar maxFinalScoreMinus = inputCtrl === true ? constant.var(dfeUInt(SCORE_BIT), 0) : maxFinalScoreMinusBuffed;		
+		////DFEVar maxFinalScoreMinusNew = dfeUInt(SCORE_BIT).newInstance(this);
+		
+
+		DFEVector<DFEVar> scoreColTmp = score_t.newInstance(this);
+		DFEVector<DFEVar> sDelColTmp = score_t.newInstance(this);
+		DFEVector<DFEVar> sInsColTmp = score_t.newInstance(this);
+		DFEVector<DFEVar> score2ColTmp = score_t.newInstance(this);
+		
+		//debug.simPrintf(id === 75, "scoreColTmp: ");
+		for (int i = 0; i < MAXREADLEN; i++) {
+			scoreColTmp[i] <==  (i === (readLen32 - 1) & idx >= (readLen32 - 1) & idx < (readLen32 + refLen32 - 1)) ? vScoreNew[i]: 0;
+			//debug.simPrintf(id === 75, "%d,", scoreColTmp[i]);
+			
+			sDelColTmp[i] <==  (i === (readLen32 - 1) & idx >= (readLen32 - 1) & idx < (readLen32 + refLen32 - 1)) ? sDelScoreNew[i]: 0;
+			sInsColTmp[i] <==  (i === (readLen32 - 1) & idx >= (readLen32 - 1) & idx < (readLen32 + refLen32 - 1)) ? sInsScoreNew[i]: 0;
+
+			//score2ColTmp[i] <==  (i === (readLen32 - 1) & idx >= (readLen32 - 1) & idx < (readLen32 + refLen32 - 1)) ? vScore2Col[i]: 0;
+		}
+		
+		//debug.simPrintf(id === 75, "\n");
+		DFEVar scoreColTmpBit = scoreColTmp.pack();
+		DFEVar sDelColTmpBit = sDelColTmp.pack();
+		DFEVar sInsColTmpBit = sInsColTmp.pack();
+		////DFEVar score2ColTmpBit = score2ColTmp.pack();
+
+		//#TODO: need to find a way to optimize it
+		DFEVar scoreTmp = (scoreColTmpBit >> ((readLen11 -1)* SCORE_BIT)).cast(dfeUInt(MAXREADLEN * SCORE_BIT));
+		DFEVar sDelTmp = (sDelColTmpBit >> ((readLen11 -1)* SCORE_BIT)).cast(dfeUInt(MAXREADLEN * SCORE_BIT));
+		DFEVar sInsTmp = (sInsColTmpBit >> ((readLen11 -1)* SCORE_BIT)).cast(dfeUInt(MAXREADLEN * SCORE_BIT));
+		////DFEVar score2Tmp = (score2ColTmpBit >> ((readLen11 -1)* SCORE_BIT)).cast(dfeUInt(MAXREADLEN * SCORE_BIT));
+		
+		maxFinalScoreNew = KernelMath.max(scoreTmp.cast(dfeUInt(SCORE_BIT)), maxFinalScore);
+
+		maxFinalsDelNew = scoreTmp.cast(dfeUInt(SCORE_BIT)) > maxFinalScore ? sDelTmp.cast(dfeUInt(SCORE_BIT)): maxFinalsDel;
+		maxFinalsInsNew = scoreTmp.cast(dfeUInt(SCORE_BIT)) > maxFinalScore ? sInsTmp.cast(dfeUInt(SCORE_BIT)): maxFinalsIns;
+		maxFinalLocNew = scoreTmp.cast(dfeUInt(SCORE_BIT)) > maxFinalScore ? idx: maxFinalLoc;
+		
+		////maxFinalScoreMinusNew = scoreTmp.cast(dfeUInt(SCORE_BIT)) > maxFinalScore ? score2Tmp.cast(dfeUInt(SCORE_BIT)): maxFinalScoreMinus;
+		
+		debug.simPrintf(id === 75, "final score: %d, %d, %d, %d \n", 
+				maxFinalScoreNew, maxFinalsDelNew, maxFinalsInsNew, maxFinalLocNew);
+
+
+
+		
+		DFEVar idxNew = idx + 1;
+		
+		//DFEVar inputCtrlPost = (idxNew >= (readLen32 + refLen32 - 1))? constant.var(true) : constant.var(false);
+		DFEVar inputCtrlPost = (idxNew >= (MAXREADLEN + MAXREFLEN - 1))? constant.var(true) : constant.var(false);
+		
+
+		
+		
+		/*****BRAM and signals for storing matrix*****/
+		Count.Params paramsRdNum = control.count.makeParams(BRAM_ADDR_BIT)
+				.withMax(interleave.cast(dfeUInt(32)))
+				.withWrapMode(WrapMode.COUNT_LT_MAX_THEN_WRAP)
+				.withEnable(inputCtrl === true);
+		
+		Counter counterRdNum = control.count.makeCounter(paramsRdNum);
+		DFEVar rdNumCnt = counterRdNum.getCount();
+		
+		DFEVar rdBaseAddrBuffed = dfeUInt(BRAM_ADDR_BIT).newInstance(this);
+		DFEVar rdBaseAddr = inputCtrl === true ? rdNumCnt : rdBaseAddrBuffed;
+		//hack to fix multiplication
+		DFEVar curAddr = rdBaseAddr * constant.var(dfeUInt(BRAM_ADDR_BIT), (MAXREADLEN + MAXREFLEN)) - 
+							rdBaseAddr + idx.cast(dfeUInt(BRAM_ADDR_BIT));
+		
+		
+		// address counter for writing into RAM
+		DFEVar bramDepth = io.scalarInput("bramDepth", dfeInt(32));
+		
+		// wrEn and block ram
+		Count.Params paramsCntBramDepth = control.count.makeParams(BRAM_ADDR_BIT)
+									.withMax((bramDepth).cast(dfeUInt(BRAM_ADDR_BIT)));	
+		Counter cntrBramDepth = control.count.makeCounter(paramsCntBramDepth);
+		DFEVar cntBramDepth = cntrBramDepth.getCount();
+
+
+		
+		Count.Params paramsWrEnCnt = control.count.makeParams(1)
+										.withEnable(cntrBramDepth.getWrap());
+		Counter paramsWrEnCounter = control.count.makeCounter(paramsWrEnCnt);
+		DFEVar wrEn1 = paramsWrEnCounter.getCount();
+
+
+		// signal to notify that we can read from block ram
+		DFEVar n_matRdEn = control.count.pulse(1, cntBramDepth ===  bramDepth.cast(dfeUInt(BRAM_ADDR_BIT)) - 1).cast(dfeBool());
+		DFEVar matRdEn = ~n_matRdEn;
+
+		Memory<DFEVector<DFEVar>> vScoreRam0 = mem.alloc(score_t, ((MAXREADLEN + MAXREFLEN - 1) * INTERLEAVE));
+		Memory<DFEVector<DFEVar>> sDelScoreRam0 = mem.alloc(score_t, ((MAXREADLEN + MAXREFLEN - 1) * INTERLEAVE));
+		Memory<DFEVector<DFEVar>> sInsScoreRam0 = mem.alloc(score_t, ((MAXREADLEN + MAXREFLEN - 1) * INTERLEAVE));
+		
+		Memory<DFEVector<DFEVar>> vScoreRam1 = mem.alloc(score_t, ((MAXREADLEN + MAXREFLEN - 1) * INTERLEAVE));
+		Memory<DFEVector<DFEVar>> sDelScoreRam1 = mem.alloc(score_t, ((MAXREADLEN + MAXREFLEN - 1) * INTERLEAVE));
+		Memory<DFEVector<DFEVar>> sInsScoreRam1 = mem.alloc(score_t, ((MAXREADLEN + MAXREFLEN - 1) * INTERLEAVE));
+		
+		vScoreRam0.write(curAddr.cast(dfeUInt(BLK_RAM_ADDR_PWR)), vScoreNew, ~wrEn1);
+		sDelScoreRam0.write(curAddr.cast(dfeUInt(BLK_RAM_ADDR_PWR)), sDelScoreNew, ~wrEn1);
+		sInsScoreRam0.write(curAddr.cast(dfeUInt(BLK_RAM_ADDR_PWR)), sInsScoreNew, ~wrEn1);
+		
+		vScoreRam1.write(curAddr.cast(dfeUInt(BLK_RAM_ADDR_PWR)), vScoreNew, wrEn1);
+		sDelScoreRam1.write(curAddr.cast(dfeUInt(BLK_RAM_ADDR_PWR)), sDelScoreNew, wrEn1);
+		sInsScoreRam1.write(curAddr.cast(dfeUInt(BLK_RAM_ADDR_PWR)), sInsScoreNew, wrEn1);
+
+		
+
+
+		/*****Backtracking signals*****/
+		// signal for selcting the correct matrix / block ram
+		Count.Params paramsCntBramDepth2x = control.count.makeParams(BRAM_ADDR_BIT)
+									.withMax((bramDepth * 2).cast(dfeUInt(BRAM_ADDR_BIT)));	
+		Counter cntrBramDepth2x = control.count.makeCounter(paramsCntBramDepth2x);
+		DFEVar cntBramDepth2x = cntrBramDepth2x.getCount();
+
+
+		Count.Params paramsCntMatSel = 
+								control.count.makeParams(1)
+									.withEnable(cntBramDepth2x === (bramDepth - interleave - 1).cast(dfeUInt(BRAM_ADDR_BIT)) |
+										cntBramDepth2x === (bramDepth * 2 - interleave - 1).cast(dfeUInt(BRAM_ADDR_BIT)));
+		Counter cntrMatSel = control.count.makeCounter(paramsCntMatSel);
+		
+		DFEVar matrdSel0 = cntrMatSel.getCount();
+		DFEVar matrdSel1 = ~matrdSel0.cast(dfeBool());
+		
+		//DFEVar MatEn_n = control.count.pulse(1, cntBramDepth === bramDepth.cast(dfeUInt(BRAM_ADDR_BIT)) - 1)
+
+
+		DFEVar id_b_i = Reductions.streamHold(id, inputCtrlPost === true);
+
+		DFEVector<DFEVar> ref_b_i = Reductions.streamHold(ref, inputCtrlPost === true);
+		DFEVar readLen_b_i = Reductions.streamHold(readLen, inputCtrlPost === true);
+		
+		DFEVar maxFinalScore_b_i = Reductions.streamHold(maxFinalScoreNew, inputCtrlPost === true);
+		DFEVar maxFinalsDel_b_i = Reductions.streamHold(maxFinalsDelNew, inputCtrlPost === true);
+		DFEVar maxFinalsIns_b_i = Reductions.streamHold(maxFinalsInsNew, inputCtrlPost === true);
+		DFEVar maxFinalLoc_b_i = Reductions.streamHold(maxFinalLocNew, inputCtrlPost === true);
+		DFEVar isPad_b_i = Reductions.streamHold(isPad, inputCtrlPost === true);
+
+		// so at the end of the write, we start initalize the read address
+		//DFEVar inputCtrl_b = (inputCtrlPost & matrdSel0).cast(dfeBool());
+		DFEVar inputCtrl_b = (inputCtrlPost).cast(dfeBool());
+
+
+		// base address
+		Count.Params paramsCntRdNumMatrd = control.count.makeParams(BRAM_ADDR_BIT)
+				.withMax(interleave.cast(dfeUInt(BRAM_ADDR_BIT)))
+				.withWrapMode(WrapMode.COUNT_LT_MAX_THEN_WRAP)
+				.withEnable(inputCtrl_b === true);
+		
+		Counter cntrRdNumMatrd = control.count.makeCounter(paramsCntRdNumMatrd);
+		DFEVar cntRdNumMatrd = cntrRdNumMatrd.getCount();
+
+		DFEVar rdBaseAddrMatrdBuffed = dfeUInt(BRAM_ADDR_BIT).newInstance(this);
+		DFEVar rdBaseAddrMatrd = inputCtrl_b === true ? cntRdNumMatrd : rdBaseAddrMatrdBuffed;
+		//hack to fix multiplication
+		DFEVar curBaseAddrMatrd = rdBaseAddrMatrd * constant.var(dfeUInt(BRAM_ADDR_BIT), (MAXREADLEN + MAXREFLEN)) - 
+										rdBaseAddrMatrd;
+
+
+		DFEVar id_bBuffed = dfeUInt(32).newInstance(this);
+		DFEVar id_b = inputCtrl_b === true ? id_b_i : id_bBuffed;
+
+		DFEVector<DFEVar> ref_bBuffed = ref_t.newInstance(this);
+		DFEVector<DFEVar> ref_b = inputCtrl_b === true ? ref_b_i: ref_bBuffed;
+
+		DFEVar readLen_bBuffed = dfeUInt(8).newInstance(this);
+		DFEVar readLen_b = inputCtrl_b === true ? readLen_b_i: readLen_bBuffed;
+
+		DFEVar maxFinalScore_bBuffed = dfeUInt(SCORE_BIT).newInstance(this);
+		DFEVar maxFinalScore_b = inputCtrl_b === true ? maxFinalScore_b_i : maxFinalScore_bBuffed;
+	
+		DFEVar maxFinalsDel_bBuffed = dfeUInt(SCORE_BIT).newInstance(this);
+		DFEVar maxFinalsDel_b = inputCtrl_b === true ? maxFinalsDel_b_i : maxFinalsDel_bBuffed;	
+	
+		DFEVar maxFinalsIns_bBuffed = dfeUInt(SCORE_BIT).newInstance(this);
+		DFEVar maxFinalsIns_b = inputCtrl_b === true ? maxFinalsIns_b_i : maxFinalsIns_bBuffed;
+
+		DFEVar maxFinalLoc_bBuffed = dfeUInt(BRAM_ADDR_BIT).newInstance(this);
+		DFEVar maxFinalLoc_b = inputCtrl_b === true ? maxFinalLoc_b_i : maxFinalLoc_bBuffed;
+
+
+		DFEVar readShft_bBuffed = dfeUInt(11).newInstance(this);// I think the init signal can also be zero....
+		DFEVar readShft_b = inputCtrl_b === true ? readLen_b_i.cast(dfeUInt(11)): readShft_bBuffed;
+
+		DFEVar done_bBuffed = dfeBool().newInstance(this);
+		DFEVar done_b = inputCtrl_b === true ? constant.var(false): done_bBuffed;
+
+		DFEVar isPad_bBuffed = dfeUInt(PADSIZE).newInstance(this);
+		DFEVar isPad_b = inputCtrl_b === true ? isPad_b_i: isPad_bBuffed;
+		
+
+		// block ram output
+		DFEVector<DFEVar> vScoreOut0_bBuffed  = score_t.newInstance(this);
+		DFEVector<DFEVar> vScoreOut0_b = inputCtrl_b === true ? //| matRdEn === false
+						constant.vect(MAXREADLEN, dfeUInt(SCORE_BIT), 0) : vScoreOut0_bBuffed;
+
+		DFEVector<DFEVar> sDelScoreOut0_bBuffed  = score_t.newInstance(this);
+		DFEVector<DFEVar> sDelScoreOut0_b = inputCtrl_b === true ? //| matRdEn === false
+						constant.vect(MAXREADLEN, dfeUInt(SCORE_BIT), 0) : sDelScoreOut0_bBuffed;
+
+		DFEVector<DFEVar> sInsScoreOut0_bBuffed  = score_t.newInstance(this);
+		DFEVector<DFEVar> sInsScoreOut0_b = inputCtrl_b === true ? //| matRdEn === false
+						constant.vect(MAXREADLEN, dfeUInt(SCORE_BIT), 0) : sInsScoreOut0_bBuffed;
+
+
+
+		DFEVector<DFEVar> vScoreOut1_bBuffed  = score_t.newInstance(this);
+		DFEVector<DFEVar> vScoreOut1_b = inputCtrl_b === true ? //| matRdEn === false
+						constant.vect(MAXREADLEN, dfeUInt(SCORE_BIT), 0) : vScoreOut1_bBuffed;
+
+		DFEVector<DFEVar> sDelScoreOut1_bBuffed  = score_t.newInstance(this);
+		DFEVector<DFEVar> sDelScoreOut1_b = inputCtrl_b === true ? //| matRdEn === false
+						constant.vect(MAXREADLEN, dfeUInt(SCORE_BIT), 0) : sDelScoreOut1_bBuffed;
+
+		DFEVector<DFEVar> sInsScoreOut1_bBuffed  = score_t.newInstance(this);
+		DFEVector<DFEVar> sInsScoreOut1_b = inputCtrl_b === true ? //| matRdEn === false
+						constant.vect(MAXREADLEN, dfeUInt(SCORE_BIT), 0) : sInsScoreOut1_bBuffed;
+
+
+
+		//check vScore, sIns, sDel to know how many shifting / which loc to go
+		DFEVar readShftInit = (maxFinalScore_b_i === maxFinalsDel_b_i ) ? readLen_b_i.cast(dfeUInt(11)) - 1:
+									(maxFinalScore_b_i === maxFinalsIns_b_i) ? readLen_b_i.cast(dfeUInt(11)):
+									readLen_b_i.cast(dfeUInt(11)) - 1;
+
+		
+		DFEVar locInit = (maxFinalScore_b_i === maxFinalsDel_b_i |  maxFinalScore_b_i === maxFinalsIns_b_i) ? 
+							maxFinalLoc_b_i - 1 : maxFinalLoc_b_i - 2;
+
+		DFEVar rdAddrInit = locInit + curBaseAddrMatrd;
+
+
+
+		// wrEn1 means rdEn0
+		DFEVar vScoreOutBit = matrdSel0 === 1 ? vScoreOut0_b.pack(): vScoreOut1_b.pack();
+		DFEVar sDelScoreOutBit = matrdSel0 === 1 ? sDelScoreOut0_b.pack(): sDelScoreOut1_b.pack();
+		DFEVar sInsScoreOutBit = matrdSel0 === 1 ? sInsScoreOut0_b.pack(): sInsScoreOut1_b.pack();
+		
+		DFEVar scoreMatrdTmp = (vScoreOutBit >> ((readShft_b -1) * SCORE_BIT)).cast(dfeUInt(MAXREADLEN * SCORE_BIT));
+		DFEVar sDelMatrdTmp = (sDelScoreOutBit >> ((readShft_b -1) * SCORE_BIT)).cast(dfeUInt(MAXREADLEN * SCORE_BIT));
+		DFEVar sInsMatrdTmp = (sInsScoreOutBit >> ((readShft_b -1) * SCORE_BIT)).cast(dfeUInt(MAXREADLEN * SCORE_BIT));
+
+		DFEVar scoreMatrd = scoreMatrdTmp.cast(dfeUInt(SCORE_BIT));
+		DFEVar sDelMatrd = sDelMatrdTmp.cast(dfeUInt(SCORE_BIT));
+		DFEVar sInsMatrd = sInsMatrdTmp.cast(dfeUInt(SCORE_BIT));
+
+
+		//check DRAM vScore, sIns, sDel to know how many shifting / which loc to go
+		DFEVar readShftNew = (scoreMatrd === sDelMatrd ) ? readShft_b.cast(dfeUInt(11)) - 1:
+									(scoreMatrd === sInsMatrd) ? readShft_b.cast(dfeUInt(11)):
+									readShft_b.cast(dfeUInt(11)) - 1;
+
+		DFEVar locNew = (scoreMatrd === sDelMatrd |  scoreMatrd === sInsMatrd) ? 
+								maxFinalLoc_b - 1 : maxFinalLoc_b - 2;
+		DFEVar rdAddrNew = locNew + curBaseAddrMatrd;
+
+
+		DFEVar readShftNxt = inputCtrl_b === true ? readShftInit : readShftNew;
+		DFEVar locNxt = inputCtrl_b === true ? locInit : locNew;							
+		DFEVar rdAddrNxt = inputCtrl_b === true ? rdAddrInit : rdAddrNew;
+	
+		
+		DFEVar rdAddrNxt_hold0 = Reductions.streamHold(rdAddrNxt, (inputCtrlPost === true | matRdEn === true) & matrdSel0);
+		DFEVar rdAddrNxt_hold1 = Reductions.streamHold(rdAddrNxt, (inputCtrlPost === true | matRdEn === true) & matrdSel1);
+
+		DFEVector<DFEVar> vScoreOut0 = vScoreRam0.read(rdAddrNxt_hold0.cast(dfeUInt(BLK_RAM_ADDR_PWR)));
+		DFEVector<DFEVar> sDelScoreOut0 = sDelScoreRam0.read(rdAddrNxt_hold0.cast(dfeUInt(BLK_RAM_ADDR_PWR)));
+		DFEVector<DFEVar> sInsScoreOut0 = sInsScoreRam0.read(rdAddrNxt_hold0.cast(dfeUInt(BLK_RAM_ADDR_PWR)));
+
+		DFEVector<DFEVar> vScoreOut1 = vScoreRam1.read(rdAddrNxt_hold1.cast(dfeUInt(BLK_RAM_ADDR_PWR)));
+		DFEVector<DFEVar> sDelScoreOut1 = sDelScoreRam1.read(rdAddrNxt_hold1.cast(dfeUInt(BLK_RAM_ADDR_PWR)));
+		DFEVector<DFEVar> sInsScoreOut1 = sInsScoreRam1.read(rdAddrNxt_hold1.cast(dfeUInt(BLK_RAM_ADDR_PWR)));
+
+
+		
+		// **to record the result, trackback value (#TODO: DID NOT TEST PROPERLY)
+		DFEVector<DFEVar> rsltType_bBuffed = rsltType_t.newInstance(this);
+		DFEVector<DFEVar> rsltType_b = inputCtrl_b === true ? 
+					constant.vect(MAXREADLEN + MAXREFLEN - 1 + RSLT_TAIL_ALIGN, dfeUInt(2), 0): rsltType_bBuffed;
+
+		DFEVar rsltTypeIdx_bBuffed = dfeUInt(BRAM_ADDR_BIT).newInstance(this);
+		DFEVar rsltTypeIdx_b = inputCtrl_b === true ? 0: rsltTypeIdx_bBuffed;
+		DFEVar rsltTypeIdx_b10 = rsltTypeIdx_b.cast(dfeUInt(10));
+		
+		DFEVar rsltLoc_bBuffed = dfeUInt(BRAM_ADDR_BIT).newInstance(this);
+		DFEVar rsltLoc_b = inputCtrl_b === true ? maxFinalLoc_b_i: rsltLoc_bBuffed;
+
+		//0 is insert
+		//1 is delete
+		//2 is mismatch/match
+		DFEVar rsltTypeInit = (maxFinalScore_b_i === maxFinalsIns_b_i) ? constant.var(dfeUInt(2), 0) :
+							 (maxFinalScore_b_i === maxFinalsDel_b_i) ? constant.var(dfeUInt(2), 1) :
+							 constant.var(dfeUInt(2), 2);//check if it will be mismatch next round
+
+		DFEVar rsltTypeNew = (scoreMatrd === sInsMatrd) ? constant.var(dfeUInt(2), 0) :
+						(scoreMatrd === sDelMatrd) ? constant.var(dfeUInt(2), 1) :
+						constant.var(dfeUInt(2), 2);//check if it will be mismatch next round
+		
+		DFEVar rsltTypeNxt = inputCtrl_b === true ? rsltTypeInit: rsltTypeNew;
+
+		
+
+		// cast to the bitwidth 2 * MAXREADLEN, and then shift
+		DFEVar rsltTypeNxtBit = rsltTypeNxt.cast(dfeUInt(2 * (MAXREADLEN + MAXREFLEN - 1 + RSLT_TAIL_ALIGN)));
+		rsltTypeNxtBit = rsltTypeNxtBit << (rsltTypeIdx_b10 * 2);
+
+		// get th original result type, and do an OR
+		DFEVar rsltTypeBit_b = rsltType_b.pack();
+		DFEVar rsltTypeBitNxt_b = rsltTypeBit_b | rsltTypeNxtBit.cast(dfeRawBits(2 * (MAXREADLEN + MAXREFLEN - 1 + RSLT_TAIL_ALIGN)));
+
+		DFEVector <DFEVar> rsltTypeNxt_b = rsltTypeBitNxt_b.reinterpret(rsltType_t);
+
+		DFEVar rsltTypeIdxNew_b = rsltTypeIdx_b + 1;
+
+
+
+		id_bBuffed <== stream.offset(id_b, -interleave, -40,-20);
+		ref_bBuffed <== stream.offset(ref_b, -interleave, -40,-20);
+		readLen_bBuffed <== stream.offset(readLen_b, -interleave, -40,-20);
+		maxFinalScore_bBuffed <== stream.offset(maxFinalScore_b, -interleave, -40,-20);
+		maxFinalsDel_bBuffed <== stream.offset(maxFinalsDel_b, -interleave, -40,-20);
+		maxFinalsIns_bBuffed <== stream.offset(maxFinalsIns_b, -interleave, -40,-20);
+
+		maxFinalLoc_bBuffed <== stream.offset(locNxt, -interleave, -40,-20);
+
+
+		rdBaseAddrMatrdBuffed <== stream.offset(rdBaseAddrMatrd, -interleave, -40,-20);
+		readShft_bBuffed <== stream.offset(readShftNxt, -interleave, -40,-20); 
+
+
+		
+
+		
+		vScoreOut0_bBuffed <== stream.offset(vScoreOut0, -interleave, -40,-20); 
+		sDelScoreOut0_bBuffed <== stream.offset(sDelScoreOut0, -interleave, -40,-20); 
+		sInsScoreOut0_bBuffed <== stream.offset(sInsScoreOut0, -interleave, -40,-20); 
+
+		vScoreOut1_bBuffed <== stream.offset(vScoreOut1, -interleave, -40,-20); 
+		sDelScoreOut1_bBuffed <== stream.offset(sDelScoreOut1, -interleave, -40,-20); 
+		sInsScoreOut1_bBuffed <== stream.offset(sInsScoreOut1, -interleave, -40,-20); 
+
+
+		// recording traceback
+		rsltType_bBuffed <== stream.offset(rsltTypeNxt_b, -interleave, -40,-20);
+		rsltTypeIdx_bBuffed <== stream.offset(rsltTypeIdxNew_b, -interleave, -40,-20);
+		rsltLoc_bBuffed <== stream.offset(rsltLoc_b, -interleave, -40,-20);
+
+
+		DFEStructType outRslt_t = new DFEStructType(
+			sft("id_b", dfeUInt(32)),
+			sft("rsltType_b", rsltType_t),
+			sft("rsltMaxScore_b", dfeUInt(MAX_SCORE_BIT)),
+			sft("rsltLoc_b", dfeUInt(BRAM_ADDR_BIT)),
+			sft("isOvrThld_b", dfeUInt(BOOL_BIT)),
+			sft("isPad", dfeUInt(RSLT_PADSIZE))
+		);
+		
+		DFEVar outEn = (isPad_b === 0 & done_b === false) ?(readShft_b === constant.var(dfeUInt(11), 1) & readShftNew != constant.var(dfeUInt(11), 1)) | maxFinalLoc_b === 0 :
+											constant.var(false);
+		DFEVar done_bNew = done_b | outEn === true;
+
+		
+		DFEStruct outRslt = outRslt_t.newInstance(this);
+		outRslt.set("id_b", id_b);
+		outRslt.set("rsltType_b", rsltTypeNxt_b);
+
+		outRslt.set("rsltMaxScore_b", maxFinalScore_b.cast(dfeUInt(MAX_SCORE_BIT)));
+		outRslt.set("rsltLoc_b", rsltLoc_b);
+		outRslt.set("isOvrThld_b", (maxFinalScore_b >= thresholdScore).cast(dfeUInt(BOOL_BIT)));
+		outRslt.set("isPad", constant.var(dfeUInt(RSLT_PADSIZE), 0));
+
+		io.output("outRsltOut", outRslt, outRslt_t, outEn === 1);
+		
+
+		done_bBuffed <== stream.offset(done_bNew, -interleave, -40,-20);
+		isPad_bBuffed <== stream.offset(isPad_b, -interleave, -40,-20);
+		
+
+		
+		
+
+		
+		
+		/*DFEStructType outbram_t = new DFEStructType(
+				sft("id", dfeUInt(32)),
+				sft("fake_entry1", dfeUInt(32)),
+				sft("fake_entry2", dfeUInt(32)),
+				sft("fake_entry3", dfeUInt(32)),
+				sft("fake_entry4", dfeUInt(32)),
+				sft("fake_entry5", dfeUInt(32)),
+				sft("fake_entry6", dfeUInt(32)),
+				sft("fake_entry7", dfeUInt(32))
+				);
+
+
+		DFEStruct outbram = outbram_t.newInstance(this);
+		outbram.set("id", constant.var(dfeUInt(32), 23));
+		outbram.set("fake_entry1", rdNumCnt.cast(dfeUInt(32)));
+		outbram.set("fake_entry2", vScoreNew[20].cast(dfeUInt(32)));
+		outbram.set("fake_entry3", sDelScoreNew[23].cast(dfeUInt(32)));
+		outbram.set("fake_entry4", sInsScoreNew[21].cast(dfeUInt(32)));
+		outbram.set("fake_entry5", maxFinalLoc_b.cast(dfeUInt(32)));
+		outbram.set("fake_entry6", maxFinalLocNew.cast(dfeUInt(32)));		
+		outbram.set("fake_entry7", sInsScoreNew[24].cast(dfeUInt(32)));	
+		
+		
+		io.output("outbramOut", outbram, outbram_t, inputCtrlPost === 1);//wrEn1 === false & wrAddr === 1);*/
+		
+		
+
+		
+				
+
+
+		
+		//---connect streams
+		idBuffed <== stream.offset(id, -interleave, -40,-20);
+		readBuffed <== stream.offset(read, -interleave, -40,-20);
+		readLenBuffed <== stream.offset(readLen, -interleave, -40,-20);
+		refBuffed <== stream.offset(ref, -interleave, -40,-20);
+		refLenBuffed <== stream.offset(refLen, -interleave, -40,-20);
+		qsBuffed <== stream.offset(qs, -interleave, -40,-20);
+		isPadBuff <== stream.offset(isPad, -interleave, -40,-20);
+		
+		sysArrayBuffed <== stream.offset(sysArrayNew, -interleave, -40,-20);
+		preSysArrayBuffed <== stream.offset(preSysArrayNew, -interleave, -40,-20);
+		
+		idxBuffed <== stream.offset(idxNew, -interleave, -40,-20);
+		
+		sDelScoreBuffed <== stream.offset(sDelScoreNew, -interleave, -40,-20); 
+		sInsScoreBuffed <== stream.offset(sInsScoreNew, -interleave, -40,-20); 
+		vScore1ColBuffed <== stream.offset(vScoreNew, -interleave, -40,-20); 
+		vScore2ColBuffed <== stream.offset(vScoreNew, -interleave*2, -40 * 2,-15 * 2); 
+		
+
+		maxFinalScoreBuffed <== stream.offset(maxFinalScoreNew, -interleave, -40,-20); 
+		maxFinalsDelBuffed <== stream.offset(maxFinalsDelNew, -interleave, -40,-20); 
+		maxFinalsInsBuffed <== stream.offset(maxFinalsInsNew, -interleave, -40,-20);
+		maxFinalLocBuffed <== stream.offset(maxFinalLocNew, -interleave, -40,-20); 
+		////maxFinalScoreMinusBuffed <== stream.offset(maxFinalScoreMinusNew, -interleave, -40,-20); 
+
+		
+		
+		rdBaseAddrBuffed <== stream.offset(rdBaseAddr, -interleave, -40,-20); 
+		inputCtrlPostBuffed <== stream.offset(inputCtrlPost,  -interleave, -40,-20);
+
+		
+
+		flush.whenInputFinished("seqIn");
+		
+		/***
+		 * 
+		 * 
+		 */
+		
+
+		// alignment output
+		/*DFEStructType out_t = new DFEStructType(
+							sft("id", dfeUInt(32)),
+							sft("fake_entry1", dfeUInt(32)),
+							sft("fake_entry2", dfeUInt(32)),
+							sft("fake_entry3", dfeUInt(32)));
+
+		
+		DFEStruct out = out_t.newInstance(this);
+		out.set("id", id);
+		out.set("fake_entry1", vScoreNew[101].cast(dfeUInt(32)));
+		out.set("fake_entry2", maxFinalScoreNew.cast(dfeUInt(32)));//maxFinalScoreNew
+		out.set("fake_entry3", ref_b[0].cast(dfeUInt(32)));//maxFinalLocNew
+
+		
+		
+		io.output("alignOut", out, out_t, inputCtrlPost === true);*/
+		
+		
+		
+		// simulation output
+		/*debug.simPrintf(id === 75, "sysArrayNew:  ");
+		for (int i = 0; i < MAXREFLEN; i++) {
+			debug.simPrintf(id === 75, "%d ", sysArrayNew[i]);
+		}
+		
+		debug.simPrintf(id === 75, "\n preSysArray:  ");
+		for (int i = 0; i < MAXREFLEN; i++) {
+			debug.simPrintf(id === 75, "%d ", preSysArrayNew[i]);
+		}		*/
+		
+		
+		// testing for the Smith-Waterman Calculation
+		
+		debug.simPrintf(id === 75, "vScoreNew:  ");
+		for (int i = 0; i < MAXREADLEN; i++) {
+			debug.simPrintf(id === 75 & vScoreNew[i] !== constant.var(dfeUInt(SCORE_BIT), 1023), "%d ", vScoreNew[i]);
+		}	
+		debug.simPrintf(id === 75, "\nsDelScore:  ");
+		for (int i = 0; i < MAXREADLEN; i++) {
+			debug.simPrintf(id === 75 & sDelScoreNew[i] !== constant.var(dfeUInt(SCORE_BIT), 1023), "%d ", sDelScoreNew[i]);
+		}
+		debug.simPrintf(id === 75, "\nsInsScore:  ");
+		for (int i = 0; i < MAXREADLEN; i++) {
+			debug.simPrintf(id === 75 & sInsScoreNew[i] !== constant.var(dfeUInt(SCORE_BIT), 1023), "%d ", sInsScoreNew[i]);
+		}
+		//debug.simPrintf(id === 75, "max: %d, %d loc: %d", maxFinalScoreNew, maxFinalScoreNew);//, maxFinalLocNew);
+//debug.simPrintf(id === 75, "max: %d, %d", maxFinalScoreNew,inputCtrlPost);
+		
+		debug.simPrintf(id === 75,
+		".........id %d idx %d curAddr %d wrEn1 %d cntBramDepth %d matRdEn %d matrdSel0 %d inputCtrlPost %d  isPad_b %d\n ", 
+		id, idxNew, curAddr, wrEn1, cntBramDepth, matRdEn, matrdSel0, inputCtrlPost, idPadCovert);//id === 75, 
+
+//debug.simPrintf(id === 75, "id_o %d  maxFinalScore_o %d  maxFinalsDel_o %d maxFinalLocNew_o %d\n ", 
+//						id_b, maxFinalScore_b, maxFinalsDel_b, maxFinalLoc_b);
+
+debug.simPrintf(id_b === 75, 
+"id_b %d  maxFinalScore_b %d  maxFinalsDel_b %d maxFinalsIns_b %d maxFinalLoc_b %d curBaseAddrMat %d rdAddrNxt_hold0 %d\n\n ", 
+id_b, maxFinalScore_b, maxFinalsDel_b, maxFinalsIns_b, maxFinalLoc_b, curBaseAddrMatrd, rdAddrNxt_hold0);
+
+debug.simPrintf(id_b === 75, 
+"id_b %d  scoreMatrd %d  sDelMatrd %d sInsMatrd %d readShft_b %d readShftNew %d\n ", 
+ id_b, scoreMatrd, sDelMatrd, sInsMatrd, readShft_b, readShftNew);
+
+
+debug.simPrintf( id_b === 75, 
+"backtrack result info rsltTypeIdxNew_b %d , outEn %d \n\n ", 
+ rsltLoc_bBuffed, outEn);
+
+
+ 
+
+		//debug.simPrintf(id === 75, "maxScrInlv[1] %d  maxsDelInlv[1] %d  maxsInsInlv[1] %d  maxLocInlv[1] %d\n\n", 
+							//maxScrInlv[1], maxsDelInlv[1], maxsInsInlv[1], maxLocInlv[1]);
+
+		debug.simPrintf(id === 75, "\n\n");
+		//debug.simPrintf("rdBaseAddr %d %d %d", rdBaseAddr, curAddr, MAXREADLEN + MAXREFLEN - 1);
+		
+		//debug.simPrintf("wrAddr %d %d \n", wrAddr, wrEn1);
+		
+		//debug.simPrintf("inputCtrl: %d \t", inputCtrl);
+		/*debug.simPrintf("wrAddr2Times:  %d \t", wrAddr2Times);
+		debug.simPrintf("wrAddr:  %d ", wrAddr);
+
+		debug.simPrintf("Internal ID:  %d ", internalId);
+		
+		debug.simPrintf("%d %d %d \n", wrEn0, wrEn1, wrMaxEn0);*/
+	}
+
+}

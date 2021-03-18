@@ -1,0 +1,158 @@
+package smith;
+
+import com.maxeler.maxcompiler.v2.build.EngineParameters;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.base.DFEVar;
+import com.maxeler.maxcompiler.v2.managers.custom.DFELink;
+import com.maxeler.maxcompiler.v2.managers.custom.blocks.KernelBlock;
+import com.maxeler.maxcompiler.v2.managers.engine_interfaces.CPUTypes;
+import com.maxeler.maxcompiler.v2.managers.engine_interfaces.EngineInterface;
+import com.maxeler.maxcompiler.v2.managers.engine_interfaces.InterfaceParamArray;
+import com.maxeler.maxcompiler.v2.managers.engine_interfaces.EngineInterface.Direction;
+import com.maxeler.maxcompiler.v2.managers.engine_interfaces.InterfaceParam;
+import com.maxeler.maxeleros.managercompiler.configuration.ManagerConfiguration;
+import com.maxeler.platform.max5.board.Max5MaxelerOsPlatform;
+import com.maxeler.platform.max5.manager.BuildConfig;
+import com.maxeler.platform.max5.manager.BuildConfig.OptimizationGoal;
+import com.maxeler.platform.max5.manager.ImplementationStrategy;
+import com.maxeler.platform.max5.manager.MAX5CManager;
+
+
+public class SmithAlphaManager extends MAX5CManager {
+
+	public static final String kernelName = "SmithAlphaKernel";
+	//public static final String bkTrkKernelName = "bkTrkKernel";
+	
+	private static final int N_KRNL = 1;
+
+	public SmithAlphaManager(EngineParameters params) {
+		super(params);
+		
+		//build config
+		ManagerConfiguration config = this.getManagerConfig();
+	    config.setStreamClockFrequencyMHz(200);
+	    
+	    BuildConfig buildConfig = this.getBuildConfig();
+	    buildConfig.setBuildEffort(BuildConfig.Effort.HIGH);
+	    setupMax5(buildConfig);
+	    
+	    for (int i = 0; i < N_KRNL; i++) {
+	    	KernelBlock kSmith = addKernel(new SmithAlphaKernel(makeKernelParameters(kernelName + i)));
+	    	//KernelBlock kBckTrk = addKernel(new bkTrkKernel(makeKernelParameters(bkTrkKernelName + i)));
+	    	
+			DFELink seqIn = addStreamFromCPU("seqIn" + i);
+			kSmith.getInput("seqIn") <== seqIn;
+			
+			//DFELink alignOut = addStreamToCPU("alignOut" + i);
+			//alignOut <== kSmith.getOutput("alignOut");
+			
+			DFELink outRsltOut = addStreamToCPU("outRsltOut" + i);
+			outRsltOut <== kSmith.getOutput("outRsltOut");
+			
+			
+			//kBckTrk.getInput("bkTrkStream") <== kSmith.getOutput("bkTrkStream0");
+
+			
+	    }
+
+
+	}
+	
+	static void setupMax5(BuildConfig buildConf) {//, KernelConfiguration kernelConfig
+		buildConf.setImplementationStrategies(getImpStrategies());
+		buildConf.setParallelism(8);
+		buildConf.setImplementationNearMissRetries(4);
+		buildConf.setImplementationNearMissThreshold(2000);
+		//kernelConfig.optimization.setUseGlobalClockBuffer(true);
+		//kernelConfig.debug.setEnableLatencyAnnotation(true);
+		//kernelConfig.simulation.setRAMAddressCollisionBehaviour(SimulationBehaviour.IGNORE);
+		//kernelConfig.optimization.setTriAddsEnabled(false); // TODO: Check if helped
+	}
+	
+	static ImplementationStrategy[] getImpStrategies() {
+		ImplementationStrategy[] strats = {//ImplementationStrategy.VIVADO_DEFAULT, ImplementationStrategy.PERFORMANCE_EXPLORE,
+		ImplementationStrategy.MAXELER1, //ImplementationStrategy.MAXELER2,
+		ImplementationStrategy.MAXELER3, //ImplementationStrategy.MAXELER4,
+		 ImplementationStrategy.PERFORMANCE_NET_DELAY_HIGH,
+		//ImplementationStrategy.CONGESTION_SPREAD_LOGIC_HIGH, 
+		ImplementationStrategy.CONGESTION_SPREAD_LOGIC_EXPLORE,
+		ImplementationStrategy.AREA_EXPLORE_WITH_REMAP, ImplementationStrategy.PERFORMANCE_EXTRA_TIMING_OPT,
+		ImplementationStrategy.PERFORMANCE_NET_DELAY_LOW,
+		
+		ImplementationStrategy.PERFORMANCE_EARLY_BLOCK_PLACEMENT,
+		ImplementationStrategy.PERFORMANCE_REFINE_PLACEMENT,
+		ImplementationStrategy.PERFORMANCE_RETIMING
+		};
+		return strats;
+	}
+	
+    // align engine interface
+    private static EngineInterface interfaceAlign(String name) {
+    	EngineInterface ei = new EngineInterface(name);
+    	
+    	InterfaceParam maScore = ei.addParam("MA", CPUTypes.UINT32);
+    	InterfaceParam mnScore = ei.addParam("MN", CPUTypes.UINT32);
+    	InterfaceParam mxScore = ei.addParam("MX", CPUTypes.UINT32);
+
+    	InterfaceParam npScore = ei.addParam("NP", CPUTypes.UINT8);
+
+    	InterfaceParam rdgOpenScore = ei.addParam("RDG_OPEN", CPUTypes.UINT32);
+    	InterfaceParam rdgExtendScore = ei.addParam("RDG_EXTEND", CPUTypes.UINT32);
+    	
+    	InterfaceParam rfgOpenScore = ei.addParam("RFG_OPEN", CPUTypes.UINT32);
+    	InterfaceParam rfgExtendScore = ei.addParam("RFG_EXTEND", CPUTypes.UINT32);
+
+		InterfaceParam thresholdScoreIn = ei.addParam("thresholdScoreIn", CPUTypes.UINT32);
+    	
+    	InterfaceParam interleave = ei.addParam("interleave", CPUTypes.UINT8);
+    	InterfaceParam bramDepth = ei.addParam("bramDepth", CPUTypes.UINT32);
+    	
+    
+    	InterfaceParamArray nBytesInput = ei.addParamArray("nBytesInput", CPUTypes.UINT64);
+    	InterfaceParamArray nBytesOutput = ei.addParamArray("nBytesOutput", CPUTypes.UINT64);
+    	
+    	//InterfaceParamArray bramnBytesOutput = ei.addParamArray("bramnBytesOutput", CPUTypes.UINT64);
+    	
+    	for (int i = 0; i < N_KRNL; i++) {
+    		ei.setScalar(kernelName + i, "MA", maScore);
+    		ei.setScalar(kernelName + i, "MN", mnScore);
+    		ei.setScalar(kernelName + i, "MX", mxScore);
+
+    		ei.setScalar(kernelName + i, "NP", npScore);
+
+    		ei.setScalar(kernelName + i, "RDG_OPEN", rdgOpenScore);
+    		ei.setScalar(kernelName + i, "RDG_EXTEND", rdgExtendScore);
+    		
+    		ei.setScalar(kernelName + i, "RFG_OPEN", rfgOpenScore);
+    		ei.setScalar(kernelName + i, "RFG_EXTEND", rfgExtendScore);
+
+    		ei.setScalar(kernelName + i, "thresholdScoreIn", thresholdScoreIn);
+    		
+    		ei.setScalar(kernelName + i, "interleave", interleave);
+    		ei.setScalar(kernelName + i, "bramDepth", bramDepth);
+    		
+    		
+    		ei.setStream("seqIn" + i, CPUTypes.UINT64, nBytesInput.get(i));
+    	    //ei.setStream("alignOut" + i, CPUTypes.UINT64, nBytesOutput.get(i));
+    	    
+			ei.setStream("outRsltOut" + i, CPUTypes.UINT64, nBytesOutput.get(i));
+			
+
+			//ei.setScalar(bkTrkKernelName + i, "interleave", interleave);
+    	    
+    	    
+    	}
+    	ei.ignoreAll(Direction.IN_OUT);
+    	return ei;
+    }
+    
+
+	public static void main(final String[] argv) {
+		final EngineParameters params = new EngineParameters(argv);
+		final SmithAlphaManager manager = new SmithAlphaManager(params);
+		
+		manager.createSLiCinterface(interfaceAlign("Align"));
+		manager.suppressDefaultInterface();
+		manager.build();
+	}
+
+}
